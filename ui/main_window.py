@@ -13,6 +13,7 @@ New flow:
   VideoProcessorWorker → rendered MP4 files
 """
 import os
+import hashlib
 import subprocess
 from typing import List, Optional
 
@@ -22,20 +23,39 @@ from PySide6.QtWidgets import (
     QSplitter, QScrollArea, QLabel, QMessageBox,
     QApplication
 )
-from qfluentwidgets import (
-    setTheme, Theme, PushButton, InfoBar,
-    InfoBarPosition, isDarkTheme
-)
+try:
+    from qfluentwidgets import (
+        setTheme, Theme, PushButton, InfoBar,
+        InfoBarPosition, isDarkTheme
+    )
+except ImportError:
+    Theme = None
+    def setTheme(*args, **kwargs): pass
+    def isDarkTheme(): return False
+    class InfoBarPosition:
+        TOP = "TOP"
+        BOTTOM = "BOTTOM"
+    class InfoBar:
+        @classmethod
+        def error(cls, *args, **kwargs): pass
+        @classmethod
+        def success(cls, *args, **kwargs): pass
+        @classmethod
+        def warning(cls, *args, **kwargs): pass
+        @classmethod
+        def info(cls, *args, **kwargs): pass
+    class PushButton:
+        pass
 
 import uuid
 from core.config import VideoInfo, SegmentInfo, CutConfig, OutputConfig, AudioInfo, AudioConfig, AudioPlaylistItem
 from core.pool_manager import SegmentPool, BatchPlanner, InsufficientSegmentsError
-from core.audio_pool_manager import AudioPool, AudioPicker, InsufficientAudioError
+from core.audio_pool_manager import AudioPool, InsufficientAudioError
 from core.audio_scanner import scan_audio_directory
 from core.video_processor import VideoProcessorWorker
 from core.export_planner import ExportPlanner
 from core.media_catalog import CatalogSegment
-from core.models import ConfigAdapterV2
+from core.models import ConfigAdapterV2, compute_media_content_hash
 from core.history_repository import HistoryRepository
 from core.history_manager import HistoryManager, _make_segment_key
 from core.plan_manifest import PlanClip, PlanManifest
@@ -463,11 +483,18 @@ class MainWindow(QMainWindow):
 
     def _convert_segments_to_catalog(self, segments: List[SegmentInfo], fps: float = 30.0) -> List[CatalogSegment]:
         res = []
+        path_to_asset_id = {}
         for s in segments:
             start_f = sec_to_frames(s.start_sec, fps)
             end_f = sec_to_frames(s.end_sec, fps)
             frames = max(1, end_f - start_f)
-            aid = f"asset_{s.source_video_name}"
+            src_path = s.source_video_path or s.source_video_name
+            if src_path not in path_to_asset_id:
+                if os.path.isfile(src_path):
+                    path_to_asset_id[src_path] = f"asset_{compute_media_content_hash(src_path)}"
+                else:
+                    path_to_asset_id[src_path] = f"asset_{hashlib.sha256(src_path.encode('utf-8')).hexdigest()[:12]}"
+            aid = path_to_asset_id[src_path]
             res.append(
                 CatalogSegment(
                     segment_id=s.segment_id,
@@ -497,17 +524,20 @@ class MainWindow(QMainWindow):
 
         v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg)
 
-        if cut_cfg.use_export_history:
-            history_keys = HistoryManager().load_history_keys()
-            available_pool = [s for s in self.pool.all_segments if _make_segment_key(s.source_video_name, s.start_sec, s.end_sec) not in history_keys]
-        else:
-            available_pool = list(self.pool.all_segments)
+        # 1. Convert master pool segments to catalog segments with content-based asset_id (V01, V03)
+        all_catalog_segs = self._convert_segments_to_catalog(self.pool.master_pool, fps=v3_cut_cfg.fps)
 
-        if not available_pool:
+        # 2. Filter unexported segments via SQLite interval overlap query (V02, V03)
+        if cut_cfg.use_export_history:
+            history_repo = HistoryRepository()
+            catalog_segs = history_repo.filter_unexported_segments(all_catalog_segs)
+        else:
+            catalog_segs = all_catalog_segs
+
+        if not catalog_segs:
             self.progress_panel.log("ERROR", "Tất cả các đoạn video trong kho đều đã xuất trước đó.")
             return None
 
-        catalog_segs = self._convert_segments_to_catalog(available_pool, fps=v3_cut_cfg.fps)
         audio_tracks = self.audio_pool.tracks if (hasattr(self, "audio_pool") and self.audio_pool) else []
         audio_cfg = self.audio_panel.get_config()
         out_cfg = self.output_panel.get_config()
@@ -754,7 +784,9 @@ class MainWindow(QMainWindow):
 
             manifest = getattr(self, "current_manifest", None)
 
-            # V3 Pre-export reservation lock (R01, R04)
+            # V3 Pre-export reservation lock (R01, R04, V02)
+            history_repo = None
+            job_id = None
             if cut_cfg.use_export_history:
                 history_repo = HistoryRepository()
                 job_id = f"job_{uuid.uuid4().hex[:8]}"
@@ -802,12 +834,20 @@ class MainWindow(QMainWindow):
                 output_config=out_cfg,
                 audio_playlists=audio_playlists_to_send,
                 record_history=cut_cfg.use_export_history,
+                render_cache=getattr(self, "render_cache", None),
+                job_id=job_id,
+                history_repo=history_repo,
                 parent=self
             )
             self._connect_worker_signals()
             self.worker.start()
 
         except Exception as e:
+            if history_repo and job_id:
+                try:
+                    history_repo.release_reservations(job_id)
+                except Exception:
+                    pass
             self.progress_panel.set_running_state(False)
             self.progress_panel.log("ERROR", f"Lỗi khởi chạy xuất video: {e}")
             InfoBar.error(

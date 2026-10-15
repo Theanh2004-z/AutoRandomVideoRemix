@@ -573,6 +573,8 @@ class VideoProcessorWorker(QThread):
         audio_playlists: Optional[List[List[AudioPlaylistItem]]] = None,
         record_history: bool = False,
         render_cache: Optional[Any] = None,
+        job_id: Optional[str] = None,
+        history_repo: Optional[Any] = None,
         parent=None
     ):
         super().__init__(parent)
@@ -581,6 +583,8 @@ class VideoProcessorWorker(QThread):
         self.audio_playlists = audio_playlists or []
         self.record_history = record_history
         self.render_cache = render_cache
+        self.job_id = job_id
+        self.history_repo = history_repo
         self.engine: Optional[VideoProcessorEngine] = None
         self.audio_engine: Optional[AudioProcessorEngine] = None
 
@@ -668,47 +672,61 @@ class VideoProcessorWorker(QThread):
             render_cache=self.render_cache
         )
 
-        for v_i, plan in enumerate(self.batch_plans):
-            if self.engine._is_cancelled:
-                break
-
-            video_idx = v_i + 1
-            out_path = get_next_output_path(
-                output_dir=out_dir,
-                ext="mp4",
-                prefix=self.output_config.output_prefix,
-                reserved_paths=reserved_paths
-            )
-            self.video_started.emit(video_idx, total_videos, out_path)
-
-            audio_pl = self.audio_playlists[v_i] if v_i < len(self.audio_playlists) else (
-                self.audio_playlists[0] if self.audio_playlists else None
-            )
-
-            ok = self.engine.process_video_plan(
-                plan=plan,
-                output_file_path=out_path,
-                video_index=video_idx,
-                total_videos=total_videos,
-                audio_playlist=audio_pl
-            )
-
-            if ok:
-                success_count += 1
-                if self.record_history:
-                    try:
-                        added = HistoryManager().record_exported_segments(plan)
-                        if added > 0:
-                            self.log_emitted.emit("INFO", f"Đã lưu {added} đoạn vào lịch sử export_history.json.")
-                    except Exception:
-                        pass
-                self.video_completed.emit(video_idx, out_path)
-            else:
+        try:
+            for v_i, plan in enumerate(self.batch_plans):
                 if self.engine._is_cancelled:
-                    self.log_emitted.emit("WARNING", f"Đã dừng xử lý video #{video_idx}.")
                     break
+
+                video_idx = v_i + 1
+                out_path = get_next_output_path(
+                    output_dir=out_dir,
+                    ext="mp4",
+                    prefix=self.output_config.output_prefix,
+                    reserved_paths=reserved_paths
+                )
+                self.video_started.emit(video_idx, total_videos, out_path)
+
+                audio_pl = self.audio_playlists[v_i] if v_i < len(self.audio_playlists) else (
+                    self.audio_playlists[0] if self.audio_playlists else None
+                )
+
+                ok = self.engine.process_video_plan(
+                    plan=plan,
+                    output_file_path=out_path,
+                    video_index=video_idx,
+                    total_videos=total_videos,
+                    audio_playlist=audio_pl
+                )
+
+                if ok:
+                    success_count += 1
+                    # Commit history to SQLite and remove this plan's reservations (V02)
+                    if self.history_repo and self.job_id:
+                        try:
+                            self.history_repo.commit_job_history(self.job_id, plan)
+                        except Exception as hist_err:
+                            self.log_emitted.emit("WARNING", f"Lỗi lưu lịch sử SQLite: {hist_err}")
+                    if self.record_history:
+                        try:
+                            added = HistoryManager().record_exported_segments(plan)
+                            if added > 0:
+                                self.log_emitted.emit("INFO", f"Đã lưu {added} đoạn vào lịch sử export_history.json.")
+                        except Exception:
+                            pass
+                    self.video_completed.emit(video_idx, out_path)
                 else:
-                    self.error_occurred.emit(f"Xử lý video #{video_idx} thất bại.")
+                    if self.engine._is_cancelled:
+                        self.log_emitted.emit("WARNING", f"Đã dừng xử lý video #{video_idx}.")
+                        break
+                    else:
+                        self.error_occurred.emit(f"Xử lý video #{video_idx} thất bại.")
+        finally:
+            # Clean up any uncommitted reservations if job failed, was cancelled, or finished (V02)
+            if self.history_repo and self.job_id:
+                try:
+                    self.history_repo.release_reservations(self.job_id)
+                except Exception:
+                    pass
 
         self.batch_finished.emit(success_count, total_videos)
 

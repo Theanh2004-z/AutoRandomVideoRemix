@@ -33,6 +33,9 @@ from core.errors import (
     InsufficientSegmentsError, InsufficientAudioError, HistoryConflictError
 )
 from core.config import SegmentInfo, AudioConfig, OutputConfig, CutConfig, VideoInfo, AudioInfo
+from core.pool_manager import SegmentPool
+from core.video_processor import VideoProcessorWorker
+from ui.main_window import MainWindow
 
 
 class TestV3ReviewFixes(unittest.TestCase):
@@ -417,6 +420,190 @@ class TestV3ReviewFixes(unittest.TestCase):
             expected_fps=30.0
         )
         self.assertTrue(res_pass.is_valid)
+
+    # -----------------------------------------------------------------
+    # V01: MainWindow _build_plans with Real SegmentPool API
+    # -----------------------------------------------------------------
+    def test_v01_main_window_build_plans_with_real_segment_pool(self):
+        """V01: MainWindow._build_plans must work cleanly with real SegmentPool."""
+        pool = SegmentPool()
+        self.assertTrue(hasattr(pool, "all_segments"))
+        self.assertEqual(pool.all_segments, pool.master_pool)
+
+        v = VideoInfo(
+            path="v1.mp4", filename="v1.mp4", duration=20.0,
+            fps=30.0, width=1920, height=1080, size_bytes=10000,
+            codec="h264", has_audio=True
+        )
+        pool.build([v], segment_duration=5.0)
+        self.assertEqual(len(pool.all_segments), 4)
+
+        class DummyMainWindow:
+            def __init__(self, p):
+                self.pool = p
+                self.progress_panel = MagicMock()
+                self.table_view = MagicMock()
+                self.audio_pool = MagicMock(tracks=[])
+                self.audio_panel = MagicMock()
+                self.audio_panel.get_config.return_value = AudioConfig()
+                self.audio_panel.get_export_target.return_value = "video_only"
+                self.output_panel = MagicMock()
+                self.output_panel.get_config.return_value = OutputConfig()
+
+            _convert_segments_to_catalog = MainWindow._convert_segments_to_catalog
+            _build_plans = MainWindow._build_plans
+
+        dummy_ui = DummyMainWindow(pool)
+        cut_cfg = CutConfig(segment_duration=5.0, target_total_duration=10.0, batch_count=1, use_export_history=False)
+        plans = dummy_ui._build_plans(cut_cfg)
+        self.assertIsNotNone(plans, "Plans must be created successfully without AttributeError")
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(len(plans[0]), 2)
+
+        # Test with use_export_history=True
+        cut_cfg_hist = CutConfig(segment_duration=5.0, target_total_duration=10.0, batch_count=1, use_export_history=True)
+        plans_hist = dummy_ui._build_plans(cut_cfg_hist)
+        self.assertIsNotNone(plans_hist)
+
+    # -----------------------------------------------------------------
+    # V02: Reservation Release on Error/Cancel and Retry Enablement
+    # -----------------------------------------------------------------
+    def test_v02_job_failure_releases_reservations_and_allows_retry(self):
+        """V02: VideoProcessorWorker failure/cancellation must release reservations so retry succeeds."""
+        db_path = os.path.join(self.temp_dir, "test_v02_history.db")
+        repo = HistoryRepository(db_path)
+
+        clip = PlanClip(
+            clip_id="c1", segment_id="seg_c1", asset_id="asset_v1", source_path="v1.mp4",
+            source_filename="v1.mp4", start_sec=0.0, end_sec=5.0,
+            effective_duration=5.0, start_frame=0, end_frame=150,
+            frame_count=150, target_video_index=1, plan_position=1
+        )
+
+        job_1 = "job_test_fail_1"
+        self.assertTrue(repo.reserve_batch(job_1, [clip]))
+
+        # Simulate VideoProcessorWorker running where engine.process_video_plan returns False (failed render)
+        worker = VideoProcessorWorker(
+            batch_plans=[[clip]],
+            output_config=OutputConfig(output_dir=self.temp_dir),
+            job_id=job_1,
+            history_repo=repo
+        )
+
+        with patch.object(worker, "engine", create=True) as mock_engine:
+            mock_engine._is_cancelled = False
+            mock_engine.process_video_plan.return_value = False
+            with patch("core.video_processor.VideoProcessorEngine", return_value=mock_engine):
+                worker.run()
+
+        # Reservations for job_1 must have been cleaned up in finally block!
+        with repo._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM reservations WHERE job_id = ?;", (job_1,))
+            self.assertEqual(cur.fetchone()[0], 0, "Failed job reservations must be cleaned up")
+
+        # History records must be 0
+        self.assertEqual(repo.get_total_records(), 0)
+
+        # Retry with job_2 must SUCCEED because clip is no longer reserved!
+        job_2 = "job_test_retry_2"
+        self.assertTrue(repo.reserve_batch(job_2, [clip]), "Retry reservation must succeed after failure cleanup")
+
+        # Now test successful run commits history and clears reservation
+        worker_success = VideoProcessorWorker(
+            batch_plans=[[clip]],
+            output_config=OutputConfig(output_dir=self.temp_dir),
+            job_id=job_2,
+            history_repo=repo
+        )
+        with patch.object(worker_success, "engine", create=True) as mock_engine:
+            mock_engine._is_cancelled = False
+            mock_engine.process_video_plan.return_value = True
+            with patch("core.video_processor.VideoProcessorEngine", return_value=mock_engine):
+                worker_success.run()
+
+        # Reservations for job_2 must be cleared, and history record committed!
+        with repo._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM reservations;")
+            self.assertEqual(cur.fetchone()[0], 0)
+        self.assertEqual(repo.get_total_records(), 1)
+
+    # -----------------------------------------------------------------
+    # V03: UI Adapter Uses Content-Based Asset ID Across Directories
+    # -----------------------------------------------------------------
+    def test_v03_convert_segments_to_catalog_unique_source_identity(self):
+        """V03: _convert_segments_to_catalog must not collapse different files with same basename."""
+        dir_a = os.path.join(self.temp_dir, "dirA")
+        dir_b = os.path.join(self.temp_dir, "dirB")
+        os.makedirs(dir_a, exist_ok=True)
+        os.makedirs(dir_b, exist_ok=True)
+
+        path_a = os.path.join(dir_a, "same.mp4")
+        path_b = os.path.join(dir_b, "same.mp4")
+        with open(path_a, "wb") as f:
+            f.write(b"CONTENT_AAA_BYTES")
+        with open(path_b, "wb") as f:
+            f.write(b"CONTENT_BBB_BYTES")
+
+        s_a = SegmentInfo(segment_id="sa", source_video_name="same.mp4", source_video_path=path_a, start_sec=0.0, end_sec=5.0, duration=5.0, segment_index=1)
+        s_b = SegmentInfo(segment_id="sb", source_video_name="same.mp4", source_video_path=path_b, start_sec=0.0, end_sec=5.0, duration=5.0, segment_index=1)
+
+        dummy = MagicMock()
+        catalog_segs = MainWindow._convert_segments_to_catalog(dummy, [s_a, s_b])
+        self.assertEqual(len(catalog_segs), 2)
+        self.assertNotEqual(catalog_segs[0].asset_id, "asset_same.mp4")
+        self.assertNotEqual(catalog_segs[1].asset_id, "asset_same.mp4")
+        self.assertNotEqual(catalog_segs[0].asset_id, catalog_segs[1].asset_id)
+
+    # -----------------------------------------------------------------
+    # V04: Authoritative Streaming Content Hash Differentiation
+    # -----------------------------------------------------------------
+    def test_v04_authoritative_streaming_content_hash_differentiation(self):
+        """V04: Content hash must stream full file and differentiate bytes outside 64K chunks."""
+        f1 = os.path.join(self.temp_dir, "file1.bin")
+        f2 = os.path.join(self.temp_dir, "file2.bin")
+        one_mb = 1024 * 1024
+        data = bytearray(b"\x00" * one_mb)
+        with open(f1, "wb") as f:
+            f.write(data)
+
+        # Modify byte at 128 KiB offset (outside initial 64KB head)
+        data[128 * 1024] = 0xFF
+        with open(f2, "wb") as f:
+            f.write(data)
+
+        h1 = compute_media_content_hash(f1, allow_cache=False)
+        h2 = compute_media_content_hash(f2, allow_cache=False)
+        self.assertNotEqual(h1, h2, "Byte change at 128 KiB must result in distinct content hash")
+
+    # -----------------------------------------------------------------
+    # V05: Manifest Fingerprint Differentiates Duplicate Track Names & Grouping
+    # -----------------------------------------------------------------
+    def test_v05_manifest_differentiation_on_duplicate_track_names_and_grouping(self):
+        """V05: Manifest fingerprint must differentiate tracks with same name in different paths and batch boundaries."""
+        c1 = PlanClip(
+            clip_id="c1", segment_id="s1", asset_id="a1", source_path="v1.mp4", source_filename="v1.mp4",
+            start_sec=0.0, end_sec=5.0, effective_duration=5.0, start_frame=0, end_frame=150, frame_count=150,
+            target_video_index=1, plan_position=1
+        )
+        c2 = PlanClip(
+            clip_id="c2", segment_id="s2", asset_id="a2", source_path="v2.mp4", source_filename="v2.mp4",
+            start_sec=0.0, end_sec=5.0, effective_duration=5.0, start_frame=0, end_frame=150, frame_count=150,
+            target_video_index=1, plan_position=2
+        )
+
+        pl_a = [[{"source_audio_path": "dirA/same.wav", "source_audio_name": "same.wav", "effective_duration": 10.0}]]
+        pl_b = [[{"source_audio_path": "dirB/same.wav", "source_audio_name": "same.wav", "effective_duration": 10.0}]]
+
+        m_a = PlanManifest.create(seed=42, catalog_snapshot_hash="snap", video_batches=[[c1]], audio_playlists=pl_a)
+        m_b = PlanManifest.create(seed=42, catalog_snapshot_hash="snap", video_batches=[[c1]], audio_playlists=pl_b)
+        self.assertNotEqual(m_a.manifest_id, m_b.manifest_id, "Different audio paths must yield different manifest IDs")
+
+        m_group1 = PlanManifest.create(seed=42, catalog_snapshot_hash="snap", video_batches=[[c1, c2]])
+        m_group2 = PlanManifest.create(seed=42, catalog_snapshot_hash="snap", video_batches=[[c1], [c2]])
+        self.assertNotEqual(m_group1.manifest_id, m_group2.manifest_id, "Different batch grouping must yield different manifest IDs")
 
 
 if __name__ == "__main__":

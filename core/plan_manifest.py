@@ -138,24 +138,31 @@ class PlanManifest:
         audio_pls = audio_playlists or []
         meta = metadata or {}
 
-        # Compute deterministic manifest ID from clips, playlists, metadata, schema version and seed (R11)
-        clip_reprs = []
-        for b in video_batches:
-            for c in b:
-                clip_reprs.append(f"{c.clip_id}:{c.effective_duration:.3f}:{c.start_frame}:{c.end_frame}")
+        # Compute deterministic manifest ID preserving batch/playlist boundaries and full source identity (V05)
+        video_reprs = []
+        for b_idx, batch in enumerate(video_batches):
+            b_clips = []
+            for c in batch:
+                asset_key = c.asset_id or c.source_path or c.source_filename
+                b_clips.append(f"{asset_key}:{c.clip_id}:{c.effective_duration:.3f}:{c.start_frame}:{c.end_frame}")
+            video_reprs.append(f"BATCH_{b_idx}:[{'|'.join(b_clips)}]")
 
         audio_reprs = []
-        for pl in audio_pls:
+        for pl_idx, pl in enumerate(audio_pls):
+            pl_items = []
             for item in pl:
-                name = item.get("source_audio_name") or item.get("source_audio_path") or ""
+                src = item.get("asset_id") or item.get("source_audio_path") or item.get("source_audio_name") or ""
                 dur = float(item.get("effective_duration", 0.0))
-                audio_reprs.append(f"{name}:{dur:.3f}")
+                trim = item.get("trim_end_sec")
+                pos = item.get("playlist_position", 0)
+                pl_items.append(f"{src}:{dur:.3f}:{trim}:{pos}")
+            audio_reprs.append(f"PLAYLIST_{pl_idx}:[{'|'.join(pl_items)}]")
 
         meta_json = json.dumps(meta, sort_keys=True, ensure_ascii=False)
         content = (
             f"SCHEMA_V3::{seed}::{catalog_snapshot_hash}::"
-            f"V:[{'|'.join(clip_reprs)}]::"
-            f"A:[{'|'.join(audio_reprs)}]::"
+            f"V:[{';'.join(video_reprs)}]::"
+            f"A:[{';'.join(audio_reprs)}]::"
             f"M:[{meta_json}]"
         )
         mid = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]

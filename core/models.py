@@ -4,7 +4,7 @@ Defines normalized immutable configuration structures and provides
 backward compatibility adapters for V2.5 configuration objects.
 """
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import hashlib
 import os
 
@@ -12,41 +12,47 @@ from core.policies import UniquePolicy, AntiConsecutivePolicy, AudioMatchMode
 from core.errors import ConfigValidationError
 
 
-def compute_media_content_hash(file_path: str, file_size: Optional[int] = None) -> str:
+_CONTENT_HASH_CACHE: Dict[Tuple[str, float, int], str] = {}
+
+
+def compute_media_content_hash(
+    file_path: str,
+    file_size: Optional[int] = None,
+    allow_cache: bool = True
+) -> str:
     """
-    Computes a content-based SHA-256 fingerprint by hashing file size
-    and chunks from start, middle, and end of file.
-    Fast (O(1) I/O regardless of file size) and independent of file path or name (R12).
+    Computes an authoritative content-based SHA-256 fingerprint by streaming
+    the file bytes (V04). Caches results by (abs_path, mtime, size) to avoid re-reading.
+    Independent of file path or name.
     """
     if not os.path.isfile(file_path):
         return hashlib.sha256(f"missing::{file_path}".encode("utf-8")).hexdigest()[:16]
 
-    size = os.path.getsize(file_path) if file_size is None else file_size
-    h = hashlib.sha256()
-    h.update(str(size).encode("utf-8"))
-
-    chunk_size = 64 * 1024  # 64 KB
+    abs_p = os.path.abspath(file_path)
     try:
-        with open(file_path, "rb") as f:
-            # Chunk 1: Head
-            head = f.read(chunk_size)
-            h.update(head)
-
-            # Chunk 2: Mid
-            if size > chunk_size * 2:
-                mid_offset = (size - chunk_size) // 2
-                f.seek(mid_offset)
-                h.update(f.read(chunk_size))
-
-            # Chunk 3: Tail
-            if size > chunk_size * 3:
-                tail_offset = max(0, size - chunk_size)
-                f.seek(tail_offset)
-                h.update(f.read(chunk_size))
+        stat = os.stat(abs_p)
+        size = stat.st_size if file_size is None else file_size
+        mtime = stat.st_mtime
     except Exception:
-        h.update(str(size).encode("utf-8"))
+        size = file_size or 0
+        mtime = 0.0
 
-    return h.hexdigest()[:16]
+    cache_key = (abs_p, mtime, size)
+    if allow_cache and cache_key in _CONTENT_HASH_CACHE:
+        return _CONTENT_HASH_CACHE[cache_key]
+
+    h = hashlib.sha256()
+    try:
+        with open(abs_p, "rb") as f:
+            while chunk := f.read(256 * 1024):
+                h.update(chunk)
+        digest = h.hexdigest()[:16]
+    except Exception:
+        digest = hashlib.sha256(f"{abs_p}::{size}::{mtime}".encode("utf-8")).hexdigest()[:16]
+
+    if allow_cache:
+        _CONTENT_HASH_CACHE[cache_key] = digest
+    return digest
 
 
 @dataclass(frozen=True)

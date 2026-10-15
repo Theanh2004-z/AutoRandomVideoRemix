@@ -88,6 +88,11 @@ class SegmentPool:
         return list(self._master)
 
     @property
+    def all_segments(self) -> List[SegmentInfo]:
+        """Ordered, unshuffled snapshot of all segments in the pool (alias for master_pool)."""
+        return list(self._master)
+
+    @property
     def draw_pool(self) -> List[SegmentInfo]:
         """Current (possibly shuffled) draw pool snapshot."""
         return list(self._draw)

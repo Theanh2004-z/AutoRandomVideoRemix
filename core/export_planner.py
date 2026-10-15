@@ -10,6 +10,7 @@ Supports:
 """
 from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import asdict
+import hashlib
 
 from core.errors import InsufficientSegmentsError, InsufficientAudioError, ConfigValidationError
 from core.policies import UniquePolicy, AntiConsecutivePolicy, AudioMatchMode
@@ -39,7 +40,13 @@ class ExportPlanner:
         self.cut_config = cut_config
         self.audio_config = audio_config
         self.output_config = output_config
-        self.catalog_snapshot_hash = catalog_snapshot_hash
+        if (catalog_snapshot_hash == "snapshot_0" or not catalog_snapshot_hash) and (video_segments or audio_tracks):
+            seg_reprs = [f"{s.asset_id or s.source_path}:{s.start_sec:.3f}:{s.end_sec:.3f}" for s in sorted(video_segments, key=lambda x: (x.asset_id, x.start_sec))]
+            aud_reprs = [f"{getattr(a, 'path', getattr(a, 'source_audio_path', str(a)))}:{getattr(a, 'duration', 0.0):.3f}" for a in audio_tracks]
+            snap_str = "|".join(seg_reprs) + "##" + "|".join(aud_reprs)
+            self.catalog_snapshot_hash = hashlib.sha256(snap_str.encode("utf-8")).hexdigest()[:16]
+        else:
+            self.catalog_snapshot_hash = catalog_snapshot_hash
         self.seed = seed
 
     def validate_plan(self) -> Tuple[bool, str]:
