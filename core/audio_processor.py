@@ -40,9 +40,13 @@ class AudioProcessorEngine:
         self.on_log("WARNING", "Đang hủy tiến trình âm thanh...")
         if self._current_subprocess:
             try:
-                self._current_subprocess.kill()
+                from core.process_runner import ProcessRunner
+                ProcessRunner.kill_process_tree(self._current_subprocess.pid)
             except Exception:
-                pass
+                try:
+                    self._current_subprocess.kill()
+                except Exception:
+                    pass
         self._cleanup_temp_dir()
 
     def _cleanup_temp_dir(self):

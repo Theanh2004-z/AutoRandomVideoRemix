@@ -55,9 +55,13 @@ class VideoProcessorEngine:
         self.on_log("WARNING", "Đang hủy tiến trình...")
         if self._current_subprocess:
             try:
-                self._current_subprocess.kill()
+                from core.process_runner import ProcessRunner
+                ProcessRunner.kill_process_tree(self._current_subprocess.pid)
             except Exception:
-                pass
+                try:
+                    self._current_subprocess.kill()
+                except Exception:
+                    pass
         self._cleanup_temp_dir()
 
     def _cleanup_temp_dir(self):
@@ -541,37 +545,50 @@ class VideoProcessorWorker(QThread):
 
         # Case 1: Standalone Audio Export
         if self.output_config.export_target == "audio_only":
-            if not self.audio_playlists or not self.audio_playlists[0]:
+            if not self.audio_playlists or not any(self.audio_playlists):
                 self.error_occurred.emit("Không có playlist âm thanh để xuất.")
                 self.batch_finished.emit(0, 1)
                 return
 
-            self.batch_started.emit(1)
+            total_audios = len(self.audio_playlists)
+            self.batch_started.emit(total_audios)
             fmt = getattr(self.output_config, "audio_output_format", "mp3")
-            out_path = get_next_output_path(
-                output_dir=out_dir,
-                ext=fmt,
-                prefix=self.output_config.output_prefix,
-                reserved_paths=reserved_paths
-            )
-            self.video_started.emit(1, 1, out_path)
+            success_count = 0
 
             self.audio_engine = AudioProcessorEngine(
                 on_log=lambda lvl, msg: self.log_emitted.emit(lvl, msg),
                 on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg)
             )
 
-            ok = self.audio_engine.process_audio_playlist(
-                playlist=self.audio_playlists[0],
-                output_file_path=out_path,
-                output_format=fmt
-            )
-            if ok:
-                self.video_completed.emit(1, out_path)
-                self.batch_finished.emit(1, 1)
-            else:
-                self.error_occurred.emit("Lỗi xuất file âm thanh.")
-                self.batch_finished.emit(0, 1)
+            for a_idx, playlist in enumerate(self.audio_playlists):
+                if self.audio_engine and self.audio_engine._is_cancelled:
+                    break
+
+                audio_num = a_idx + 1
+                out_path = get_next_output_path(
+                    output_dir=out_dir,
+                    ext=fmt,
+                    prefix=self.output_config.output_prefix,
+                    reserved_paths=reserved_paths
+                )
+                self.video_started.emit(audio_num, total_audios, out_path)
+
+                ok = self.audio_engine.process_audio_playlist(
+                    playlist=playlist,
+                    output_file_path=out_path,
+                    output_format=fmt
+                )
+                if ok:
+                    success_count += 1
+                    self.video_completed.emit(audio_num, out_path)
+                else:
+                    if self.audio_engine and self.audio_engine._is_cancelled:
+                        self.log_emitted.emit("WARNING", f"Đã dừng xử lý file âm thanh #{audio_num}.")
+                        break
+                    else:
+                        self.error_occurred.emit(f"Lỗi xuất file âm thanh #{audio_num}.")
+
+            self.batch_finished.emit(success_count, total_audios)
             return
 
         # Case 2: Video or Video + Random Audio Combined

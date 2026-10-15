@@ -59,6 +59,8 @@ class MainWindow(QMainWindow):
         self.current_audio_playlists: List[List[AudioPlaylistItem]] = []
         self.worker: Optional[VideoProcessorWorker] = None
         self._pending_start_export: bool = False
+        self._plan_is_stale: bool = True
+        self._plan_revision: int = 0
 
         self._init_ui()
         self._connect_signals()
@@ -168,6 +170,8 @@ class MainWindow(QMainWindow):
         self.source_videos = valid_videos
         self.pool = None
         self.current_batch_plans = []
+        self._plan_is_stale = True
+        self._plan_revision += 1
         self.table_view.set_plans([])
         self.progress_panel.log("INFO", f"Đã nạp {len(valid_videos)} video nguồn hợp lệ.")
         self.cut_panel.lbl_pool_info.setText("Kho đoạn: Chưa tạo")
@@ -191,6 +195,8 @@ class MainWindow(QMainWindow):
     def _on_audios_scanned(self, valid_audios: List[AudioInfo]):
         self.audio_pool = AudioPool(valid_audios)
         self.current_audio_playlists = []
+        self._plan_is_stale = True
+        self._plan_revision += 1
         self.progress_panel.log(
             "INFO",
             f"Đã nạp {len(valid_audios)} file âm thanh hợp lệ ({self.audio_pool.total_duration:.1f}s)."
@@ -207,6 +213,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(150, self._on_start_rendering)
 
     def _on_audio_config_changed(self):
+        self._plan_is_stale = True
+        self._plan_revision += 1
         target = self.audio_panel.get_export_target()
         self.output_panel.update_audio_mode_display(target)
         if target == "audio_only":
@@ -217,11 +225,15 @@ class MainWindow(QMainWindow):
             self.progress_panel.btn_start.setText("BẮT ĐẦU XUẤT (VIDEO + NHẠC NGẪU NHIÊN)")
 
     def _on_cut_config_changed(self):
+        self._plan_is_stale = True
+        self._plan_revision += 1
+        self.current_batch_plans = []
+        self.table_view.mark_plan_stale()
         cut_cfg = self.cut_panel.get_config()
         self.source_panel.update_estimated_segments(cut_cfg.segment_duration, cut_cfg.merge_remainder)
 
-    def _on_generate_audio_playlist(self) -> Optional[List[AudioPlaylistItem]]:
-        """Stage 2–3 (Phần 2): Pick audio tracks cycle by cycle."""
+    def _generate_audio_playlists(self, batch_count: int = 1) -> Optional[List[List[AudioPlaylistItem]]]:
+        """Stage 2–3 (Phần 2): Pick audio tracks for K batch outputs using V3 AudioPlanner."""
         if not self.audio_pool or self.audio_pool.total_tracks == 0:
             if self.audio_panel.valid_audios:
                 self.audio_pool = AudioPool(self.audio_panel.valid_audios)
@@ -250,22 +262,25 @@ class MainWindow(QMainWindow):
         target_dur = cut_cfg.target_total_duration
 
         try:
-            picker = AudioPicker(self.audio_pool, audio_cfg)
-            playlist = picker.pick_playlist(target_duration=target_dur)
-            self.current_audio_playlists = [playlist]
-            self.table_view.set_audio_playlist(playlist)
-            tot_eff = sum(p.effective_duration for p in playlist)
+            from core.audio_planner import AudioPlanner
+            planner = AudioPlanner(self.audio_pool.tracks, audio_cfg)
+            playlists = planner.plan_batch(batch_count=batch_count, target_duration=target_dur)
+            self.current_audio_playlists = playlists
+            if playlists:
+                self.table_view.set_audio_playlist(playlists[0])
+            self._plan_is_stale = False
+            tot_tracks = sum(len(p) for p in playlists)
             self.progress_panel.log(
                 "SUCCESS",
-                f"✓ Đã lập playlist âm thanh: {len(playlist)} bài | Tổng phát: {tot_eff:.1f}s"
+                f"✓ Đã lập {len(playlists)} playlist âm thanh ({tot_tracks} lượt bài)."
             )
             InfoBar.success(
                 title="Tạo playlist nhạc thành công",
-                content=f"{len(playlist)} bài hát ngẫu nhiên ({tot_eff:.1f}s).",
+                content=f"{len(playlists)} playlist âm thanh ngẫu nhiên ({tot_tracks} lượt bài).",
                 parent=self,
                 position=InfoBarPosition.TOP
             )
-            return playlist
+            return playlists
         except InsufficientAudioError as e:
             self.progress_panel.log("ERROR", str(e))
             InfoBar.error(title="Lỗi kho âm thanh", content=str(e), parent=self, position=InfoBarPosition.TOP)
@@ -274,8 +289,18 @@ class MainWindow(QMainWindow):
             self.progress_panel.log("ERROR", f"Lỗi tạo playlist âm thanh: {e}")
             return None
 
+    def _on_generate_audio_playlist(self) -> Optional[List[AudioPlaylistItem]]:
+        """Slot for manual audio playlist button."""
+        cut_cfg = self.cut_panel.get_config()
+        playlists = self._generate_audio_playlists(batch_count=cut_cfg.batch_count)
+        return playlists[0] if playlists else None
+
     def _on_build_pool(self):
         """Stage 2–3: Slice all videos → build pool."""
+        self._plan_is_stale = True
+        self.current_batch_plans = []
+        self.table_view.mark_plan_stale()
+
         if not self.source_videos:
             video_dir = self.source_panel.folder_edit.text().strip()
             if video_dir and os.path.isdir(video_dir):
@@ -326,6 +351,8 @@ class MainWindow(QMainWindow):
 
             # Invalidate existing plans since pool changed
             self.current_batch_plans = []
+            self._plan_is_stale = True
+            self.table_view.mark_plan_stale()
 
         except Exception as e:
             self.progress_panel.log("ERROR", f"Lỗi tạo kho đoạn: {e}")
@@ -342,6 +369,8 @@ class MainWindow(QMainWindow):
         self.pool.shuffle()
         self.table_view.set_pool(self.pool.draw_pool)
         self.current_batch_plans = []  # Plans from old order are invalid
+        self._plan_is_stale = True
+        self.table_view.mark_plan_stale()
         self.progress_panel.log(
             "SUCCESS",
             f"🔀 Đã xáo trộn kho {self.pool.total_segments} đoạn ngẫu nhiên."
@@ -428,6 +457,7 @@ class MainWindow(QMainWindow):
         try:
             plans = planner.plan_all(cut_cfg.target_total_duration)
             self.current_batch_plans = plans
+            self._plan_is_stale = False
             self.table_view.set_plans(plans)
             self.table_view.refresh_pool_used()
             return plans
@@ -450,6 +480,7 @@ class MainWindow(QMainWindow):
                 try:
                     plans = planner.plan_all(cut_cfg.target_total_duration)
                     self.current_batch_plans = plans
+                    self._plan_is_stale = False
                     self.table_view.set_plans(plans)
                     self.table_view.refresh_pool_used()
                     return plans
@@ -570,18 +601,21 @@ class MainWindow(QMainWindow):
             # CASE 1: STANDALONE AUDIO EXPORT
             # -------------------------------------------------------------
             if export_target == "audio_only":
-                playlist = self.current_audio_playlists[0] if self.current_audio_playlists else None
-                if not playlist:
-                    playlist = self._on_generate_audio_playlist()
-                    if not playlist:
-                        self.progress_panel.log("ERROR", "Không thể tạo playlist âm thanh để xuất.")
+                batch_count = cut_cfg.batch_count
+                if self._plan_is_stale or len(self.current_audio_playlists) != batch_count or not self.current_audio_playlists:
+                    self.progress_panel.log("INFO", f"🎵 Đang tự động lập kế hoạch {batch_count} playlist âm thanh...")
+                    playlists = self._generate_audio_playlists(batch_count=batch_count)
+                    if not playlists:
+                        self.progress_panel.log("ERROR", "Không thể tạo đủ playlist âm thanh để xuất.")
                         return
+                else:
+                    playlists = self.current_audio_playlists
 
                 self.progress_panel.set_running_state(True)
                 self.worker = VideoProcessorWorker(
                     batch_plans=[],
                     output_config=out_cfg,
-                    audio_playlists=[playlist],
+                    audio_playlists=playlists,
                     record_history=False,
                     parent=self
                 )
@@ -602,14 +636,15 @@ class MainWindow(QMainWindow):
                 self.pool.shuffle()
                 self.table_view.set_pool(self.pool.draw_pool)
 
-            # Auto-plan if plans not generated yet
+            # Auto-plan if plans not generated yet or stale
             plans = self.current_batch_plans
-            if not plans:
-                self.progress_panel.log("INFO", "📋 Đang tự động lập kế hoạch bốc đoạn ngẫu nhiên...")
+            if not plans or self._plan_is_stale:
+                self.progress_panel.log("INFO", "📋 Đang tự động lập kế hoạch bốc đoạn ngẫu nhiên mới nhất...")
                 plans = self._build_plans(cut_cfg)
                 if not plans:
                     self.progress_panel.log("ERROR", "Lập kế hoạch ghép video thất bại.")
                     return
+                self._plan_is_stale = False
 
             audio_playlists_to_send = []
             if export_target == "video_with_random_audio":
@@ -738,7 +773,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
+        is_running = bool(self.worker and self.worker.isRunning())
+        if is_running:
             reply = QMessageBox.question(
                 self,
                 "Xác nhận đóng",
@@ -747,10 +783,19 @@ class MainWindow(QMainWindow):
                 QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                self.worker.cancel()
-                self.worker.wait(3000)
+                if self.worker:
+                    self.worker.cancel()
+                    self.worker.wait(3000)
+                if hasattr(self.source_panel, "scanner_thread") and self.source_panel.scanner_thread and self.source_panel.scanner_thread.isRunning():
+                    self.source_panel.scanner_thread.terminate()
+                if hasattr(self.audio_panel, "scanner_thread") and self.audio_panel.scanner_thread and self.audio_panel.scanner_thread.isRunning():
+                    self.audio_panel.scanner_thread.terminate()
                 event.accept()
             else:
                 event.ignore()
         else:
+            if hasattr(self.source_panel, "scanner_thread") and self.source_panel.scanner_thread and self.source_panel.scanner_thread.isRunning():
+                self.source_panel.scanner_thread.terminate()
+            if hasattr(self.audio_panel, "scanner_thread") and self.audio_panel.scanner_thread and self.audio_panel.scanner_thread.isRunning():
+                self.audio_panel.scanner_thread.terminate()
             event.accept()

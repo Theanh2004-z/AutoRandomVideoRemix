@@ -221,6 +221,16 @@ class CutTableView(CardWidget):
         # Switch to plan tab
         self.tabs.setCurrentIndex(1)
 
+    def mark_plan_stale(self):
+        """Mark current plan in the UI as out-of-date or cleared."""
+        self._batch_plans = []
+        self.combo_target_video.blockSignals(True)
+        self.combo_target_video.clear()
+        self.combo_target_video.blockSignals(False)
+        self.plan_table.setRowCount(0)
+        self.lbl_plan_summary.setText("⚠️ Cấu hình đã đổi — Kế hoạch cũ đã hết hạn. Hãy nhấn 'Xem trước kế hoạch' để tạo lại.")
+        self.lbl_plan_summary.setStyleSheet("color: #D83B01; font-style: italic;")
+
     def _on_plan_video_selected(self, index: int):
         if 0 <= index < len(self._batch_plans):
             self._display_plan(index)

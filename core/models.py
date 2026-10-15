@@ -66,18 +66,45 @@ class ConfigAdapterV2:
           - allow_reuse == False and no_repeat_across_batch == True -> UNIQUE_BATCH
           - allow_reuse == False and no_repeat_across_batch == False -> UNIQUE_OUTPUT
         """
-        allow_reuse = getattr(legacy_cfg, "allow_reuse", False)
-        no_repeat_batch = getattr(legacy_cfg, "no_repeat_across_batch", True)
-
-        if allow_reuse:
-            unique_policy = UniquePolicy.CYCLE_OUTPUT
-        elif no_repeat_batch:
-            unique_policy = UniquePolicy.UNIQUE_BATCH
+        unique_policy_raw = getattr(legacy_cfg, "unique_policy", None)
+        if unique_policy_raw:
+            if isinstance(unique_policy_raw, UniquePolicy):
+                unique_policy = unique_policy_raw
+            else:
+                u_str = str(unique_policy_raw).lower()
+                if "cycle" in u_str:
+                    unique_policy = UniquePolicy.CYCLE_OUTPUT
+                elif "batch" in u_str:
+                    unique_policy = UniquePolicy.UNIQUE_BATCH
+                elif "output" in u_str:
+                    unique_policy = UniquePolicy.UNIQUE_OUTPUT
+                else:
+                    unique_policy = UniquePolicy.UNIQUE_BATCH
         else:
-            unique_policy = UniquePolicy.UNIQUE_OUTPUT
+            allow_reuse = getattr(legacy_cfg, "allow_reuse", False)
+            no_repeat_batch = getattr(legacy_cfg, "no_repeat_across_batch", True)
+            if allow_reuse:
+                unique_policy = UniquePolicy.CYCLE_OUTPUT
+            elif no_repeat_batch:
+                unique_policy = UniquePolicy.UNIQUE_BATCH
+            else:
+                unique_policy = UniquePolicy.UNIQUE_OUTPUT
 
-        no_consecutive = getattr(legacy_cfg, "no_consecutive_same_source", True)
-        anti_consecutive = AntiConsecutivePolicy.SOFT if no_consecutive else AntiConsecutivePolicy.OFF
+        anti_consec_raw = getattr(legacy_cfg, "anti_consecutive_policy", None)
+        if anti_consec_raw:
+            if isinstance(anti_consec_raw, AntiConsecutivePolicy):
+                anti_consecutive = anti_consec_raw
+            else:
+                a_str = str(anti_consec_raw).lower()
+                if "strict" in a_str:
+                    anti_consecutive = AntiConsecutivePolicy.STRICT
+                elif "off" in a_str:
+                    anti_consecutive = AntiConsecutivePolicy.OFF
+                else:
+                    anti_consecutive = AntiConsecutivePolicy.SOFT
+        else:
+            no_consecutive = getattr(legacy_cfg, "no_consecutive_same_source", True)
+            anti_consecutive = AntiConsecutivePolicy.SOFT if no_consecutive else AntiConsecutivePolicy.OFF
 
         cfg = NormalizedCutConfig(
             segment_duration=float(getattr(legacy_cfg, "segment_duration", 10.0)),

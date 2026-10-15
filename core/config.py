@@ -137,6 +137,8 @@ class CutConfig:
     no_consecutive_same_source: bool = True  # Avoid two consecutive segments from the same source
     trim_last_segment: bool = True          # Trim last segment to hit exact target duration
     use_export_history: bool = False        # Exclude segments previously saved in export_history.json
+    unique_policy: Optional[str] = None     # unique_batch | unique_output | cycle_output
+    anti_consecutive_policy: Optional[str] = None   # soft | strict | off
 
 
 # ------------------------------------------------------------------

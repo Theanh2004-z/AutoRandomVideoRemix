@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout, QCheckBox
 )
 from qfluentwidgets import (
-    CardWidget, SpinBox, DoubleSpinBox, PushButton
+    CardWidget, SpinBox, DoubleSpinBox, PushButton, ComboBox
 )
 from core.config import CutConfig
 from core.settings_manager import settings
@@ -108,7 +108,7 @@ class CutConfigPanel(CardWidget):
         sep.setStyleSheet("font-weight: 600; color: #444; margin-top: 6px;")
         layout.addWidget(sep)
 
-        # ── 5. Checkboxes ─────────────────────────────────────────────
+        # ── 5. Checkboxes & Selectors ─────────────────────────────────
         chk_layout = QVBoxLayout()
         chk_layout.setSpacing(7)
 
@@ -119,13 +119,6 @@ class CutConfigPanel(CardWidget):
         self.chk_merge_remainder.stateChanged.connect(self._update_summary)
         chk_layout.addWidget(self.chk_merge_remainder)
 
-        self.chk_no_consecutive = QCheckBox(
-            "Không để 2 đoạn liên tiếp từ cùng video nguồn [Khuyên dùng]", self
-        )
-        self.chk_no_consecutive.setChecked(bool(settings.get("no_consecutive_video", True)))
-        self.chk_no_consecutive.stateChanged.connect(self._update_summary)
-        chk_layout.addWidget(self.chk_no_consecutive)
-
         self.chk_trim_last = QCheckBox(
             "Cắt ngắn đoạn cuối để video đầu ra đúng thời lượng yêu cầu [Khuyên dùng]", self
         )
@@ -133,22 +126,64 @@ class CutConfigPanel(CardWidget):
         self.chk_trim_last.stateChanged.connect(self._update_summary)
         chk_layout.addWidget(self.chk_trim_last)
 
-        self.chk_no_repeat_batch = QCheckBox(
-            "Không dùng lại đoạn đã xuất ở các video trong cùng đợt batch", self
-        )
-        self.chk_no_repeat_batch.setChecked(bool(settings.get("no_repeat_batch", True)))
-        self.chk_no_repeat_batch.stateChanged.connect(self._update_summary)
-        chk_layout.addWidget(self.chk_no_repeat_batch)
+        # Policy Controls Grid
+        pol_grid = QGridLayout()
+        pol_grid.setSpacing(8)
 
-        self.chk_allow_reuse = QCheckBox(
-            "Bốc có hoàn lại — xáo trộn lại kho khi hết để tiếp tục (mặc định: TẮT)", self
-        )
-        self.chk_allow_reuse.setChecked(bool(settings.get("allow_reuse", False)))
-        self.chk_allow_reuse.stateChanged.connect(self._update_summary)
-        chk_layout.addWidget(self.chk_allow_reuse)
+        lbl_unique = QLabel("Chính sách chống trùng:")
+        lbl_unique.setStyleSheet("font-weight: 500;")
+        self.cmb_unique_policy = ComboBox(self)
+        self.cmb_unique_policy.addItem("Chống trùng cả đợt (Unique Batch) [Khuyên dùng]", userData="unique_batch")
+        self.cmb_unique_policy.addItem("Chống trùng từng video (Unique Output)", userData="unique_output")
+        self.cmb_unique_policy.addItem("Bốc có hoàn lại khi hết kho (Cycle Output)", userData="cycle_output")
+        pol_grid.addWidget(lbl_unique, 0, 0)
+        pol_grid.addWidget(self.cmb_unique_policy, 0, 1)
+
+        lbl_anti = QLabel("Tránh clip cùng nguồn:")
+        lbl_anti.setStyleSheet("font-weight: 500;")
+        self.cmb_anti_consecutive = ComboBox(self)
+        self.cmb_anti_consecutive.addItem("Tránh liên tiếp nếu có thể — Mềm (Soft) [Khuyên dùng]", userData="soft")
+        self.cmb_anti_consecutive.addItem("Bắt buộc khác nguồn — Nghiêm ngặt (Strict)", userData="strict")
+        self.cmb_anti_consecutive.addItem("Không hạn chế — Tắt (Off)", userData="off")
+        pol_grid.addWidget(lbl_anti, 1, 0)
+        pol_grid.addWidget(self.cmb_anti_consecutive, 1, 1)
+
+        chk_layout.addLayout(pol_grid)
+
+        # Legacy checkboxes (hidden for clean UI, synchronized for full backward-compat)
+        self.chk_no_repeat_batch = QCheckBox(self)
+        self.chk_no_repeat_batch.setVisible(False)
+        self.chk_no_repeat_batch.stateChanged.connect(self._on_legacy_no_repeat_changed)
+
+        self.chk_allow_reuse = QCheckBox(self)
+        self.chk_allow_reuse.setVisible(False)
+        self.chk_allow_reuse.stateChanged.connect(self._on_legacy_allow_reuse_changed)
+
+        self.chk_no_consecutive = QCheckBox(self)
+        self.chk_no_consecutive.setVisible(False)
+        self.chk_no_consecutive.stateChanged.connect(self._on_legacy_no_consecutive_changed)
+
+        # Initialize combo indices from settings
+        saved_policy = settings.get("unique_policy", None)
+        if not saved_policy:
+            if settings.get("allow_reuse", False):
+                saved_policy = "cycle_output"
+            elif settings.get("no_repeat_batch", True):
+                saved_policy = "unique_batch"
+            else:
+                saved_policy = "unique_output"
+        self.set_unique_policy(saved_policy)
+
+        saved_anti = settings.get("anti_consecutive_policy", None)
+        if not saved_anti:
+            saved_anti = "soft" if settings.get("no_consecutive_video", True) else "off"
+        self.set_anti_consecutive_policy(saved_anti)
+
+        self.cmb_unique_policy.currentIndexChanged.connect(self._on_unique_policy_changed)
+        self.cmb_anti_consecutive.currentIndexChanged.connect(self._on_anti_consecutive_changed)
 
         self.chk_use_history = QCheckBox(
-            "Loại trừ các đoạn đã từng xuất trong lịch sử (export_history.json)", self
+            "Loại trừ các đoạn đã từng xuất trong lịch sử (SQLite / export_history)", self
         )
         self.chk_use_history.setChecked(bool(settings.get("use_history", False)))
         self.chk_use_history.stateChanged.connect(self._update_summary)
@@ -182,6 +217,41 @@ class CutConfigPanel(CardWidget):
     # Slots
     # ------------------------------------------------------------------
 
+    def _on_unique_policy_changed(self, index: int):
+        u_pol = self.get_unique_policy()
+        self.chk_allow_reuse.blockSignals(True)
+        self.chk_no_repeat_batch.blockSignals(True)
+        self.chk_allow_reuse.setChecked(u_pol == "cycle_output")
+        self.chk_no_repeat_batch.setChecked(u_pol == "unique_batch")
+        self.chk_allow_reuse.blockSignals(False)
+        self.chk_no_repeat_batch.blockSignals(False)
+        self._update_summary()
+
+    def _on_anti_consecutive_changed(self, index: int):
+        a_pol = self.get_anti_consecutive_policy()
+        self.chk_no_consecutive.blockSignals(True)
+        self.chk_no_consecutive.setChecked(a_pol != "off")
+        self.chk_no_consecutive.blockSignals(False)
+        self._update_summary()
+
+    def _on_legacy_allow_reuse_changed(self, state):
+        if self.chk_allow_reuse.isChecked():
+            if self.get_unique_policy() != "cycle_output":
+                self.set_unique_policy("cycle_output")
+
+    def _on_legacy_no_repeat_changed(self, state):
+        if self.chk_no_repeat_batch.isChecked():
+            if self.get_unique_policy() != "unique_batch":
+                self.set_unique_policy("unique_batch")
+
+    def _on_legacy_no_consecutive_changed(self, state):
+        if not self.chk_no_consecutive.isChecked():
+            if self.get_anti_consecutive_policy() != "off":
+                self.set_anti_consecutive_policy("off")
+        else:
+            if self.get_anti_consecutive_policy() == "off":
+                self.set_anti_consecutive_policy("soft")
+
     def _update_summary(self):
         tot_sec = self.get_total_target_seconds()
         seg_dur = self.spin_seg_dur.value()
@@ -190,10 +260,8 @@ class CutConfigPanel(CardWidget):
         if seg_dur <= 0:
             return
 
-        import math
         num_full = int(tot_sec // seg_dur)
         rem = round(tot_sec - num_full * seg_dur, 2)
-        # With merge_remainder, the remainder folds into the last full segment
         total_clips = num_full + (1 if rem >= 0.01 and not self.chk_merge_remainder.isChecked() else 0)
         if num_full == 0:
             total_clips = 1  # At least one segment
@@ -201,10 +269,12 @@ class CutConfigPanel(CardWidget):
         rem_desc = f" + phần dư {rem:.1f}s (được gộp)" if rem >= 0.01 else ""
         batch_desc = f" | Cả đợt: ≈{total_clips * batch} đoạn ({batch} video)" if batch > 1 else ""
 
+        u_pol = self.get_unique_policy()
+        a_pol = self.get_anti_consecutive_policy()
         pool_dur = getattr(self, "_current_pool_dur", 0.0)
         warn = ""
-        if pool_dur > 0 and tot_sec > pool_dur and not self.chk_allow_reuse.isChecked():
-            warn = f"\n⚠️ Kho video chỉ có {pool_dur:.0f}s. Cần bật 'Bốc có hoàn lại' để tạo video {tot_sec/60:.0f} phút."
+        if pool_dur > 0 and tot_sec > pool_dur and u_pol != "cycle_output":
+            warn = f"\n⚠️ Kho video chỉ có {pool_dur:.0f}s. Cần chọn chính sách 'Bốc có hoàn lại' để tạo video {tot_sec/60:.0f} phút."
 
         self.lbl_summary.setText(
             f"→ Mỗi video: ≈{total_clips} đoạn ({num_full} × {seg_dur:.0f}s{rem_desc}){batch_desc}{warn}"
@@ -217,11 +287,13 @@ class CutConfigPanel(CardWidget):
             "target_secs": self.spin_secs.value(),
             "batch_count": batch,
             "merge_remainder": self.chk_merge_remainder.isChecked(),
-            "no_consecutive_video": self.chk_no_consecutive.isChecked(),
+            "no_consecutive_video": (a_pol != "off"),
             "trim_last_segment": self.chk_trim_last.isChecked(),
-            "no_repeat_batch": self.chk_no_repeat_batch.isChecked(),
-            "allow_reuse": self.chk_allow_reuse.isChecked(),
+            "no_repeat_batch": (u_pol == "unique_batch"),
+            "allow_reuse": (u_pol == "cycle_output"),
             "use_history": self.chk_use_history.isChecked(),
+            "unique_policy": u_pol,
+            "anti_consecutive_policy": a_pol,
         }, auto_save=True)
 
         self.config_changed.emit()
@@ -229,6 +301,34 @@ class CutConfigPanel(CardWidget):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def get_unique_policy(self) -> str:
+        idx = self.cmb_unique_policy.currentIndex()
+        data = self.cmb_unique_policy.itemData(idx)
+        return str(data) if data else "unique_batch"
+
+    def set_unique_policy(self, policy: str):
+        target = str(policy).lower()
+        if "cycle" in target:
+            self.cmb_unique_policy.setCurrentIndex(2)
+        elif "output" in target:
+            self.cmb_unique_policy.setCurrentIndex(1)
+        else:
+            self.cmb_unique_policy.setCurrentIndex(0)
+
+    def get_anti_consecutive_policy(self) -> str:
+        idx = self.cmb_anti_consecutive.currentIndex()
+        data = self.cmb_anti_consecutive.itemData(idx)
+        return str(data) if data else "soft"
+
+    def set_anti_consecutive_policy(self, policy: str):
+        target = str(policy).lower()
+        if "strict" in target:
+            self.cmb_anti_consecutive.setCurrentIndex(1)
+        elif "off" in target:
+            self.cmb_anti_consecutive.setCurrentIndex(2)
+        else:
+            self.cmb_anti_consecutive.setCurrentIndex(0)
 
     def get_total_target_seconds(self) -> float:
         h = self.spin_hours.value()
@@ -267,14 +367,18 @@ class CutConfigPanel(CardWidget):
             pass
 
     def get_config(self) -> CutConfig:
+        u_pol = self.get_unique_policy()
+        a_pol = self.get_anti_consecutive_policy()
         return CutConfig(
             segment_duration=self.spin_seg_dur.value(),
             target_total_duration=self.get_total_target_seconds(),
             batch_count=self.spin_batch_count.value(),
             merge_remainder=self.chk_merge_remainder.isChecked(),
-            allow_reuse=self.chk_allow_reuse.isChecked(),
-            no_repeat_across_batch=self.chk_no_repeat_batch.isChecked(),
-            no_consecutive_same_source=self.chk_no_consecutive.isChecked(),
+            allow_reuse=(u_pol == "cycle_output"),
+            no_repeat_across_batch=(u_pol == "unique_batch"),
+            no_consecutive_same_source=(a_pol != "off"),
             trim_last_segment=self.chk_trim_last.isChecked(),
             use_export_history=self.chk_use_history.isChecked(),
+            unique_policy=u_pol,
+            anti_consecutive_policy=a_pol,
         )
