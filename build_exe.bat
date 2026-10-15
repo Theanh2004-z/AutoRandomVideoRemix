@@ -30,14 +30,7 @@ echo Dang dong goi ung dung bang PyInstaller...
 echo Vui long doi trong giay lat...
 echo.
 
-"%PY_BIN%" -m PyInstaller ^
-    --name "AutoRandomVideoRemix" ^
-    --windowed ^
-    --noconfirm ^
-    --clean ^
-    --add-data "history;history" ^
-    --collect-all qfluentwidgets ^
-    app.py
+"%PY_BIN%" -m PyInstaller --noconfirm --clean AutoRandomVideoRemix.spec
 
 if %errorlevel% equ 0 (
     echo.

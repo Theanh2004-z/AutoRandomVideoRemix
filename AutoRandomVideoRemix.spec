@@ -1,12 +1,47 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('history', 'history'), ('bin', 'bin')]
+datas = [('bin', 'bin')]
 binaries = []
-hiddenimports = []
-tmp_ret = collect_all('qfluentwidgets')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = [
+    'core',
+    'core.config',
+    'core.models',
+    'core.policies',
+    'core.errors',
+    'core.timebase',
+    'core.media_catalog',
+    'core.plan_manifest',
+    'core.video_planner',
+    'core.audio_planner',
+    'core.export_planner',
+    'core.app_paths',
+    'core.history_repository',
+    'core.history_migration',
+    'core.history_manager',
+    'core.process_runner',
+    'core.job_controller',
+    'core.output_validator',
+    'core.output_commit',
+    'core.job_recovery',
+    'core.render_cache',
+    'core.disk_estimator',
+    'core.hardware_detector',
+    'core.video_processor',
+    'core.audio_processor',
+    'core.segment_slicer',
+    'core.video_scanner',
+    'core.audio_scanner',
+    'core.filename_generator',
+    'core.pool_manager',
+    'core.audio_pool_manager',
+    'sqlite3',
+]
 
+tmp_ret = collect_all('qfluentwidgets')
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ['app.py'],
@@ -17,7 +52,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['tests'],
     noarchive=False,
     optimize=0,
 )
