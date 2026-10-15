@@ -22,6 +22,7 @@ from PySide6.QtCore import QThread, Signal
 
 
 from core.hardware_detector import detect_hardware, HardwareProfile
+from core.segment_renderer import SegmentRenderer, encoder_options, cpu_filter, HardwareEncoderError, RenderCancelled
 
 
 class VideoProcessorEngine:
@@ -33,7 +34,8 @@ class VideoProcessorEngine:
         on_log: Optional[Callable[[str, str], None]] = None,
         on_segment_done: Optional[Callable[[int, int, SegmentInfo], None]] = None,
         on_progress: Optional[Callable[[float, str], None]] = None,
-        render_cache: Optional[Any] = None
+        render_cache: Optional[Any] = None,
+        source_metadata: Optional[Dict[str, VideoInfo]] = None
     ):
         self.config = output_config
         self.on_log = on_log or (lambda lvl, msg: None)
@@ -51,6 +53,11 @@ class VideoProcessorEngine:
         self._is_cancelled = False
         self._current_subprocess: Optional[subprocess.Popen] = None
         self._temp_dir: Optional[str] = None
+        self._segment_renderer = None
+        self.source_metadata = dict(source_metadata or {})
+        self.disabled_gpu_pipelines = set()
+        self.batch_render_disabled = False
+        self.last_render_stats = {}
 
     def pause(self):
         self._is_paused = True
@@ -63,6 +70,8 @@ class VideoProcessorEngine:
     def cancel(self):
         self._is_cancelled = True
         self.on_log("WARNING", "Đang hủy tiến trình...")
+        if self._segment_renderer:
+            self._segment_renderer.cancel()
         if self._current_subprocess:
             try:
                 from core.process_runner import ProcessRunner
@@ -72,7 +81,7 @@ class VideoProcessorEngine:
                     self._current_subprocess.kill()
                 except Exception:
                     pass
-        self._cleanup_temp_dir()
+        # Active tasks are joined before the render path removes its workspace.
 
     def _cleanup_temp_dir(self):
         if self._temp_dir and os.path.isdir(self._temp_dir):
@@ -87,20 +96,7 @@ class VideoProcessorEngine:
         - 'fit': keep aspect ratio and pad black borders.
         - 'crop': scale to fill and crop excess.
         """
-        if self.config.aspect_ratio_mode == "crop":
-            # Scale to cover then crop
-            return (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-                f"crop={target_w}:{target_h},"
-                f"setsar=1,format=yuv420p"
-            )
-        else:
-            # Fit & pad (default)
-            return (
-                f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black,"
-                f"setsar=1,format=yuv420p"
-            )
+        return cpu_filter(self.config)
 
     def _determine_encoder(self, force_cpu: bool = False) -> Tuple[str, List[str]]:
         """
@@ -117,8 +113,8 @@ class VideoProcessorEngine:
             target_encoder = "libx264"
             self.on_log("WARNING", "Chuyển sang chế độ CPU an toàn (libx264) để tiếp tục xử lý.")
         else:
-            profile = detect_hardware()
             req = (getattr(self.config, "hw_accel", None) or "auto").lower()
+            profile = detect_hardware() if req != 'cpu' else None
 
             if req == "auto":
                 target_encoder = profile.active_encoder
@@ -148,25 +144,7 @@ class VideoProcessorEngine:
                 target_encoder = "libx264"
                 self.on_log("INFO", "Sử dụng CPU encoder (libx264 đa luồng).")
 
-        # Quality mapping per encoder type
-        if target_encoder == "h264_nvenc":
-            cq_map = {"standard": "24", "high": "19", "very_high": "16"}
-            cq_val = cq_map.get(self.config.quality, "19")
-            opts = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", cq_val]
-        elif target_encoder == "h264_amf":
-            qp_map = {"standard": "24", "high": "20", "very_high": "17"}
-            qp_val = qp_map.get(self.config.quality, "20")
-            opts = ["-c:v", "h264_amf", "-usage", "transcoding", "-quality", "speed", "-rc", "cqp", "-qp_p", qp_val, "-qp_i", qp_val]
-        elif target_encoder == "h264_qsv":
-            gq_map = {"standard": "25", "high": "21", "very_high": "18"}
-            gq_val = gq_map.get(self.config.quality, "21")
-            opts = ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", gq_val]
-        else:
-            crf_map = {"standard": "23", "high": "19", "very_high": "16"}
-            crf_val = crf_map.get(self.config.quality, "19")
-            opts = ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf_val, "-threads", "0"]
-
-        return target_encoder, opts
+        return target_encoder, encoder_options(self.config,target_encoder)
 
     def process_video_plan(
         self,
@@ -200,7 +178,6 @@ class VideoProcessorEngine:
 
         target_w, target_h = self.config.width_height
         target_fps = self.config.fps
-        vf_string = self._build_filter_complex(target_w, target_h)
         encoder_name, encoder_opts = self._determine_encoder()
 
         total_segments = len(plan)
@@ -209,164 +186,36 @@ class VideoProcessorEngine:
         self.on_log("INFO", f"=== Bắt đầu tạo video #{video_index}/{total_videos}: {os.path.basename(output_file_path)} ===")
         self.on_log("INFO", f"Tổng số đoạn cắt: {total_segments} đoạn | Độ phân giải: {target_w}x{target_h} | FPS: {target_fps}")
 
-        # Step 5 & 6: Cut & Normalize each segment
-        for i, clip in enumerate(plan):
-            # Check pause/cancel
-            while self._is_paused and not self._is_cancelled:
-                time.sleep(0.3)
-
-            if self._is_cancelled:
-                self.on_log("WARNING", "Tiến trình đã bị hủy bởi người dùng.")
-                self._cleanup_temp_dir()
-                return False
-
-            seg_filename = f"seg_{i:05d}.mp4"
-            seg_path = os.path.join(self._temp_dir, seg_filename)
-
-            # Inform status
-            clip.status = "Đang cắt"
-            pct = round((i / total_segments) * 85.0, 1)
-            self.on_progress(pct, f"Video #{video_index}/{total_videos}: Cắt đoạn {i+1}/{total_segments} ({clip.source_video_name})")
-
-            # Check render cache first
-            cache_key = None
-            if self.render_cache and self.render_cache.enabled:
-                try:
-                    cache_key = self.render_cache.compute_key(
-                        source_path=clip.source_video_path,
-                        start_sec=clip.start_sec,
-                        duration=clip.effective_duration,
-                        width=target_w,
-                        height=target_h,
-                        fps=target_fps,
-                        aspect_ratio_mode=self.config.aspect_ratio_mode,
-                        encoder=encoder_name,
-                        audio_mode=self.config.audio_mode,
-                        quality=getattr(self.config, "quality", "standard"),
-                        encoder_opts=encoder_opts
-                    )
-                    cached_file = self.render_cache.get(cache_key)
-                    if cached_file and self.render_cache.verify_entry(cached_file):
-                        shutil.copy2(cached_file, seg_path)
-                        clip.status = "Hoàn tất"
-                        self.on_log("INFO", f"[{i+1}/{total_segments}] ⚡ Cache hit: {clip.source_video_name} ({clip.formatted_start}-{clip.formatted_end})")
-                        self.on_segment_done(i + 1, total_segments, clip)
-                        temp_segment_files.append(seg_path)
-                        continue
-                except Exception:
-                    pass
-
-            self.on_log(
-                "INFO",
-                f"[{i+1}/{total_segments}] Cắt {clip.source_video_name} "
-                f"từ {clip.formatted_start} đến {clip.formatted_end} ({clip.effective_duration:.3f}s)..."
-            )
-
-            # Build FFmpeg segment command
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(clip.start_sec),
-                "-t", str(clip.effective_duration),
-                "-i", clip.source_video_path,
-                "-vf", vf_string,
-                "-r", str(target_fps),
-            ]
-            cmd.extend(encoder_opts)
-
-            # Audio handling during segment cut
-            if self.config.audio_mode == "keep":
-                # Normalize audio to AAC 48k stereo
-                cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
-            else:
-                # 'none', 'bgm', or 'random_audio_pool': Strip audio stream entirely (-an)
-                cmd.append("-an")
-
-            cmd.append(seg_path)
-
+        # Render independently, collecting paths by plan position rather than
+        # completion order. Hardware encoder failure retries the entire batch
+        # with one CPU profile so concatenation never mixes encoder settings.
+        for attempt in range(2):
+            renderer = SegmentRenderer(self,encoder_name,encoder_opts,self._temp_dir)
+            self._segment_renderer = renderer
             try:
-                self._current_subprocess = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                )
-                _, stderr = self._current_subprocess.communicate()
-
+                temp_segment_files = renderer.render(plan,video_index,total_videos)
+                self.last_render_stats = dict(renderer.stats)
+                self.on_log('INFO',f"Xử lý đoạn: {renderer.stats['rendered']} đoạn mới, {renderer.stats['cache_hits']} đoạn từ cache, {renderer.stats['hardware_segments']} đoạn tăng tốc GPU.")
+                break
+            except HardwareEncoderError as error:
                 if self._is_cancelled:
                     self._cleanup_temp_dir()
                     return False
-
-                if self._current_subprocess.returncode != 0:
-                    err_text = stderr.decode("utf-8", errors="replace") if stderr else "Unknown error"
-                    if encoder_name != "libx264":
-                        self.on_log("WARNING", f"GPU Encoder ({encoder_name}) gặp sự cố tại đoạn {i+1}: {err_text[:120]}... Đang tự động chuyển sang CPU Fallback (libx264) để hoàn thành đoạn!")
-                        encoder_name, encoder_opts = self._determine_encoder(force_cpu=True)
-                        # Recompute cache key with actual CPU encoder settings (R06)
-                        if self.render_cache and self.render_cache.enabled:
-                            try:
-                                cache_key = self.render_cache.compute_key(
-                                    source_path=clip.source_video_path,
-                                    start_sec=clip.start_sec,
-                                    duration=clip.effective_duration,
-                                    width=target_w,
-                                    height=target_h,
-                                    fps=target_fps,
-                                    aspect_ratio_mode=self.config.aspect_ratio_mode,
-                                    encoder=encoder_name,
-                                    audio_mode=self.config.audio_mode,
-                                    quality=getattr(self.config, "quality", "standard"),
-                                    encoder_opts=encoder_opts
-                                )
-                            except Exception:
-                                pass
-                        fallback_cmd = [
-                            "ffmpeg", "-y",
-                            "-ss", str(clip.start_sec),
-                            "-t", str(clip.effective_duration),
-                            "-i", clip.source_video_path,
-                            "-vf", vf_string,
-                            "-r", str(target_fps),
-                        ]
-                        fallback_cmd.extend(encoder_opts)
-                        if self.config.audio_mode == "keep":
-                            fallback_cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
-                        else:
-                            fallback_cmd.append("-an")
-                        fallback_cmd.append(seg_path)
-
-                        self._current_subprocess = subprocess.Popen(
-                            fallback_cmd,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE,
-                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                        )
-                        _, stderr_fb = self._current_subprocess.communicate()
-                        if self._current_subprocess.returncode != 0:
-                            err_fb = stderr_fb.decode("utf-8", errors="replace") if stderr_fb else "CPU error"
-                            self.on_log("ERROR", f"Lỗi cắt đoạn {i+1} bằng CPU Fallback: {err_fb[:300]}")
-                            clip.status = "Lỗi"
-                            self._cleanup_temp_dir()
-                            return False
-                    else:
-                        self.on_log("ERROR", f"Lỗi cắt đoạn {i+1} ({clip.source_video_name}): {err_text[:300]}")
-                        clip.status = "Lỗi"
-                        self._cleanup_temp_dir()
-                        return False
-
-                clip.status = "Hoàn tất"
-                if self.render_cache and self.render_cache.enabled and cache_key:
-                    try:
-                        self.render_cache.put(cache_key, seg_path)
-                    except Exception:
-                        pass
-                temp_segment_files.append(seg_path)
-                self.on_segment_done(i + 1, total_segments, clip)
-
-            except Exception as e:
-                self.on_log("ERROR", f"Ngoại lệ khi cắt đoạn {i+1}: {e}")
-                clip.status = "Lỗi"
+                self.on_log('WARNING',f'Bộ mã hóa GPU không hoàn thành tác vụ. Đang làm lại lượt này bằng CPU để giữ cấu hình đồng nhất. {str(error)[-240:]}')
+                encoder_name,encoder_opts = self._determine_encoder(force_cpu=True)
+                for clip in plan: clip.status='Chờ xử lý'
+            except RenderCancelled:
                 self._cleanup_temp_dir()
                 return False
+            except Exception as error:
+                self.on_log('ERROR',f'Lỗi xử lý đoạn video: {error}')
+                self._cleanup_temp_dir()
+                return False
+            finally:
+                self._segment_renderer = None
+        else:
+            self._cleanup_temp_dir()
+            return False
 
         # Step 7: Concatenate all segments seamlessly
         self.on_progress(88.0, f"Video #{video_index}/{total_videos}: Đang ghép nối các đoạn video...")
@@ -575,7 +424,9 @@ class VideoProcessorWorker(QThread):
         render_cache: Optional[Any] = None,
         job_id: Optional[str] = None,
         history_repo: Optional[Any] = None,
-        parent=None
+        parent=None,
+        *,
+        source_metadata: Optional[Dict[str, VideoInfo]] = None
     ):
         super().__init__(parent)
         self.batch_plans = batch_plans
@@ -585,6 +436,8 @@ class VideoProcessorWorker(QThread):
         self.render_cache = render_cache
         self.job_id = job_id
         self.history_repo = history_repo
+        self.source_metadata = dict(source_metadata or {})
+        self._cancel_requested = False
         self.engine: Optional[VideoProcessorEngine] = None
         self.audio_engine: Optional[AudioProcessorEngine] = None
 
@@ -601,6 +454,7 @@ class VideoProcessorWorker(QThread):
             self.audio_engine.resume()
 
     def cancel(self):
+        self._cancel_requested = True
         if self.engine:
             self.engine.cancel()
         if self.audio_engine:
@@ -627,6 +481,8 @@ class VideoProcessorWorker(QThread):
                 on_log=lambda lvl, msg: self.log_emitted.emit(lvl, msg),
                 on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg)
             )
+            if self._cancel_requested:
+                self.audio_engine.cancel()
 
             for a_idx, playlist in enumerate(self.audio_playlists):
                 if self.audio_engine and self.audio_engine._is_cancelled:
@@ -669,8 +525,11 @@ class VideoProcessorWorker(QThread):
             on_log=lambda lvl, msg: self.log_emitted.emit(lvl, msg),
             on_segment_done=lambda idx, tot, seg: self.segment_progress.emit(idx, tot, seg),
             on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg),
-            render_cache=self.render_cache
+            render_cache=self.render_cache,
+            source_metadata=self.source_metadata
         )
+        if self._cancel_requested:
+            self.engine.cancel()
 
         try:
             for v_i, plan in enumerate(self.batch_plans):

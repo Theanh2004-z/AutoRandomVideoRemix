@@ -4,10 +4,11 @@ Handles Action Buttons (Start, Pause, Resume, Cancel), Progress Bars,
 and Real-Time Syntax-Colored Log Console.
 """
 import time
+from html import escape
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPlainTextEdit, QFrame
+    QPlainTextEdit, QFrame, QToolButton
 )
 from qfluentwidgets import (
     CardWidget, PushButton, PrimaryPushButton,
@@ -17,6 +18,7 @@ from qfluentwidgets import (
 
 class ProgressPanel(CardWidget):
     """Areas D & E: Process Controls, Progress Bars, and Real-time Logs."""
+    running_changed = Signal(bool)
     start_requested = Signal()
     pause_requested = Signal()
     resume_requested = Signal()
@@ -30,6 +32,7 @@ class ProgressPanel(CardWidget):
         super().__init__(parent)
         self.is_paused = False
         self.start_time: float = 0.0
+        self.last_error = ""
         self._init_ui()
 
     def _init_ui(self):
@@ -39,7 +42,7 @@ class ProgressPanel(CardWidget):
 
         # Title
         header = QHBoxLayout()
-        title = QLabel("KHU VỰC D & E: ĐIỀU KHIỂN & TIẾN TRÌNH XỬ LÝ")
+        title = QLabel("Tiến trình xuất")
         title.setObjectName("sectionHeader")
         header.addWidget(title)
         layout.addLayout(header)
@@ -74,7 +77,9 @@ class ProgressPanel(CardWidget):
         prep_layout.addWidget(self.btn_shuffle, 1)
         prep_layout.addWidget(self.btn_audio_playlist, 1)
         prep_layout.addWidget(self.btn_preview, 1)
-        layout.addLayout(prep_layout)
+        self.prep_widget = QWidget(self)
+        self.prep_widget.setLayout(prep_layout)
+        layout.addWidget(self.prep_widget)
 
         # Action Buttons Row (Area D)
         btn_layout = QHBoxLayout()
@@ -85,12 +90,12 @@ class ProgressPanel(CardWidget):
         self.btn_start.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #0078D4;")
         self.btn_start.clicked.connect(self.start_requested.emit)
 
-        self.btn_pause = PushButton("⏸ Tạm dừng", self)
+        self.btn_pause = PushButton("Tạm dừng", self)
         self.btn_pause.setMinimumHeight(38)
         self.btn_pause.setEnabled(False)
         self.btn_pause.clicked.connect(self._toggle_pause)
 
-        self.btn_cancel = PushButton("⏹ Hủy bỏ", self)
+        self.btn_cancel = PushButton("Hủy xuất", self)
         self.btn_cancel.setMinimumHeight(38)
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.setStyleSheet("color: #E81123;")
@@ -118,9 +123,9 @@ class ProgressPanel(CardWidget):
         self.lbl_video_info = QLabel("Video: 0/0")
         self.lbl_segment_info = QLabel("Đoạn: 0/0")
         self.lbl_time_info = QLabel("Thời gian: 00:00")
-        self.lbl_video_info.setStyleSheet("color: #555; font-size: 12px;")
-        self.lbl_segment_info.setStyleSheet("color: #555; font-size: 12px;")
-        self.lbl_time_info.setStyleSheet("color: #555; font-size: 12px;")
+        self.lbl_video_info.setObjectName("mutedText")
+        self.lbl_segment_info.setObjectName("mutedText")
+        self.lbl_time_info.setObjectName("mutedText")
 
         stats_row.addWidget(self.lbl_video_info)
         stats_row.addWidget(self.lbl_segment_info)
@@ -130,10 +135,19 @@ class ProgressPanel(CardWidget):
 
         layout.addLayout(prog_layout)
 
+        self.btn_toggle_logs = QToolButton(self)
+        self.btn_toggle_logs.setText("Xem nhật ký chi tiết")
+        self.btn_toggle_logs.setCheckable(True)
+        layout.addWidget(self.btn_toggle_logs)
+        self.log_widget = QWidget(self)
+        log_layout = QVBoxLayout(self.log_widget)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_toggle_logs.toggled.connect(self.log_widget.setVisible)
+
         # Real-time Log Header & Console
         log_header = QHBoxLayout()
         log_lbl = QLabel("Nhật ký xử lý chi tiết (Logs):")
-        log_lbl.setStyleSheet("font-weight: 600; color: #444;")
+        log_lbl.setObjectName("mutedText")
         log_header.addWidget(log_lbl)
         log_header.addStretch()
 
@@ -141,23 +155,26 @@ class ProgressPanel(CardWidget):
         self.btn_clear_log.setMaximumHeight(26)
         self.btn_clear_log.clicked.connect(self._clear_logs)
         log_header.addWidget(self.btn_clear_log)
-        layout.addLayout(log_header)
+        log_layout.addLayout(log_header)
 
         self.console = QPlainTextEdit(self)
         self.console.setObjectName("logConsole")
         self.console.setReadOnly(True)
         self.console.setMinimumHeight(150)
-        layout.addWidget(self.console)
+        self.console.setMaximumBlockCount(2000)
+        log_layout.addWidget(self.console)
+        layout.addWidget(self.log_widget)
+        self.log_widget.setVisible(False)
 
     def _toggle_pause(self):
         if not self.is_paused:
             self.is_paused = True
-            self.btn_pause.setText("▶ Tiếp tục")
+            self.btn_pause.setText("Tiếp tục")
             self.btn_pause.setStyleSheet("color: #107C41; font-weight: bold;")
             self.pause_requested.emit()
         else:
             self.is_paused = False
-            self.btn_pause.setText("⏸ Tạm dừng")
+            self.btn_pause.setText("Tạm dừng")
             self.btn_pause.setStyleSheet("")
             self.resume_requested.emit()
 
@@ -165,6 +182,10 @@ class ProgressPanel(CardWidget):
         self.console.clear()
 
     def log(self, level: str, message: str):
+        if level.upper() == "ERROR":
+            self.last_error = str(message)
+        message = escape(str(message))
+        level = escape(str(level))
         color_map = {
             "INFO": "#D4D4D4",
             "SUCCESS": "#4EC9B0",
@@ -190,11 +211,12 @@ class ProgressPanel(CardWidget):
         self.btn_pause.setEnabled(running)
         self.btn_cancel.setEnabled(running)
         self.is_paused = False
-        self.btn_pause.setText("⏸ Tạm dừng")
+        self.btn_pause.setText("Tạm dừng")
         self.btn_pause.setStyleSheet("")
         if running:
             self.start_time = time.time()
             self.bar_overall.setValue(0)
+        self.running_changed.emit(running)
 
     def update_overall_progress(self, percent: float, status_msg: str):
         self.bar_overall.setValue(int(percent))
@@ -211,3 +233,7 @@ class ProgressPanel(CardWidget):
     def update_stats(self, cur_video: int, total_videos: int, cur_seg: int, total_segs: int):
         self.lbl_video_info.setText(f"Video: {cur_video}/{total_videos}")
         self.lbl_segment_info.setText(f"Đoạn: {cur_seg}/{total_segs}")
+
+    def set_logs_visible(self, visible: bool):
+        self.btn_toggle_logs.setChecked(visible)
+        self.log_widget.setVisible(visible)

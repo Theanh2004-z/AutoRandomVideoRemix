@@ -57,12 +57,13 @@ _CACHED_PROFILE: Optional[HardwareProfile] = None
 
 def _probe_single_encoder(encoder_name: str) -> bool:
     """
-    Runs a tiny, instant FFmpeg render test (1 frame, 64x64, 0.05s) to guarantee
+    Runs a tiny YUV420 FFmpeg test at a broadly supported frame size to guarantee
     the hardware encoder is operational on this specific machine and driver.
     """
     cmd = [
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", "testsrc=duration=0.05:size=64x64:rate=30",
+        "-f", "lavfi", "-i", "color=c=black:size=128x128:rate=30",
+        "-t", "0.2", "-an",
         "-c:v", encoder_name,
         "-f", "null", "-"
     ]

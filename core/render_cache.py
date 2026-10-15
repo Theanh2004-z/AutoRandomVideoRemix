@@ -11,6 +11,8 @@ import os
 import shutil
 import hashlib
 import time
+import threading
+import uuid
 from typing import Optional, Dict, Any, List
 
 from core.app_paths import get_cache_dir
@@ -28,6 +30,7 @@ class RenderCache:
         self.cache_dir = cache_dir or get_cache_dir()
         self.max_size_bytes = max_size_bytes
         self.enabled = enabled
+        self._lock = threading.RLock()
         self._access_order: Dict[str, float] = {}
         if self.enabled:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -150,7 +153,7 @@ class RenderCache:
             return None
 
         target_path = self.get_cache_path(cache_key)
-        staging_path = target_path + f".tmp_{os.getpid()}_{int(time.time()*1000)}"
+        staging_path = target_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}"
 
         try:
             shutil.copy2(rendered_file_path, staging_path)

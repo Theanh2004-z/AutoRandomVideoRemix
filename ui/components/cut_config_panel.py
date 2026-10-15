@@ -11,7 +11,7 @@ Replaces the old "random position" controls with the new options:
 """
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout, QCheckBox
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout, QCheckBox, QToolButton
 )
 from qfluentwidgets import (
     CardWidget, SpinBox, DoubleSpinBox, PushButton, ComboBox
@@ -34,7 +34,7 @@ class CutConfigPanel(CardWidget):
         layout.setContentsMargins(16, 16, 16, 16)
 
         # Title
-        title = QLabel("KHU VỰC B: CẤU HÌNH CẮT & THUẬT TOÁN")
+        title = QLabel("Thời lượng và số lượng")
         title.setObjectName("sectionHeader")
         layout.addWidget(title)
 
@@ -42,7 +42,8 @@ class CutConfigPanel(CardWidget):
         grid.setSpacing(10)
 
         # ── 1. Segment duration ──────────────────────────────────────
-        lbl_seg = QLabel("Thời lượng mỗi đoạn:")
+        lbl_seg = QLabel("Độ dài mỗi đoạn video:")
+        self.segment_caption = lbl_seg
         lbl_seg.setStyleSheet("font-weight: 500;")
         self.spin_seg_dur = DoubleSpinBox(self)
         self.spin_seg_dur.setRange(1.0, 3600.0)
@@ -50,11 +51,12 @@ class CutConfigPanel(CardWidget):
         self.spin_seg_dur.setSingleStep(1.0)
         self.spin_seg_dur.setSuffix(" giây")
         self.spin_seg_dur.valueChanged.connect(self._update_summary)
-        grid.addWidget(lbl_seg, 0, 0)
-        grid.addWidget(self.spin_seg_dur, 0, 1)
+        grid.addWidget(lbl_seg, 2, 0)
+        grid.addWidget(self.spin_seg_dur, 2, 1)
 
         # ── 2. Total output duration (H / M / S) ─────────────────────
-        lbl_tot = QLabel("Tổng thời lượng video xuất:")
+        lbl_tot = QLabel("Thời lượng mỗi đầu ra:")
+        self.duration_caption = lbl_tot
         lbl_tot.setStyleSheet("font-weight: 500;")
 
         time_box = QHBoxLayout()
@@ -82,45 +84,57 @@ class CutConfigPanel(CardWidget):
         time_box.addWidget(self.spin_mins)
         time_box.addWidget(self.spin_secs)
 
-        grid.addWidget(lbl_tot, 1, 0)
-        grid.addLayout(time_box, 1, 1)
+        grid.addWidget(lbl_tot, 0, 0)
+        grid.addLayout(time_box, 0, 1)
 
         # ── 3. Summary label ──────────────────────────────────────────
         self.lbl_summary = QLabel("-", self)
+        self.lbl_summary.setWordWrap(True)
         self.lbl_summary.setStyleSheet("color: #0078D4; font-weight: 600;")
-        grid.addWidget(self.lbl_summary, 2, 0, 1, 2)
+        grid.addWidget(self.lbl_summary, 3, 0, 1, 2)
 
         # ── 4. Batch count ────────────────────────────────────────────
-        lbl_batch = QLabel("Số lượng video muốn tạo:")
+        lbl_batch = QLabel("Số lượng video:")
+        self.batch_caption = lbl_batch
         lbl_batch.setStyleSheet("font-weight: 500;")
         self.spin_batch_count = SpinBox(self)
         self.spin_batch_count.setRange(1, 100)
         self.spin_batch_count.setValue(int(settings.get("batch_count", 1)))
         self.spin_batch_count.setSuffix(" video")
         self.spin_batch_count.valueChanged.connect(self._update_summary)
-        grid.addWidget(lbl_batch, 3, 0)
-        grid.addWidget(self.spin_batch_count, 3, 1)
+        grid.addWidget(lbl_batch, 1, 0)
+        grid.addWidget(self.spin_batch_count, 1, 1)
 
         layout.addLayout(grid)
 
+        self.btn_advanced = QToolButton(self)
+        self.btn_advanced.setText("Tùy chọn chia đoạn và chống trùng")
+        self.btn_advanced.setCheckable(True)
+        layout.addWidget(self.btn_advanced)
+        self.advanced_widget = QWidget(self)
+        advanced_layout = QVBoxLayout(self.advanced_widget)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_advanced.toggled.connect(self.advanced_widget.setVisible)
+
         # ── Separator label ───────────────────────────────────────────
         sep = QLabel("Tùy chọn chia đoạn & xáo trộn:")
-        sep.setStyleSheet("font-weight: 600; color: #444; margin-top: 6px;")
-        layout.addWidget(sep)
+        sep.setObjectName("mutedText")
+        sep.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        advanced_layout.addWidget(sep)
 
         # ── 5. Checkboxes & Selectors ─────────────────────────────────
         chk_layout = QVBoxLayout()
         chk_layout.setSpacing(7)
 
         self.chk_merge_remainder = QCheckBox(
-            "Gộp phần dư (đoạn cuối ngắn hơn độ dài đặt) vào đoạn trước [Khuyên dùng]", self
+            "Gộp phần đuôi ngắn vào đoạn trước để giữ đủ nội dung", self
         )
         self.chk_merge_remainder.setChecked(bool(settings.get("merge_remainder", True)))
         self.chk_merge_remainder.stateChanged.connect(self._update_summary)
         chk_layout.addWidget(self.chk_merge_remainder)
 
         self.chk_trim_last = QCheckBox(
-            "Cắt ngắn đoạn cuối để video đầu ra đúng thời lượng yêu cầu [Khuyên dùng]", self
+            "Cắt đoạn video cuối để khớp thời lượng đã chọn", self
         )
         self.chk_trim_last.setChecked(bool(settings.get("trim_last_segment", True)))
         self.chk_trim_last.stateChanged.connect(self._update_summary)
@@ -133,18 +147,18 @@ class CutConfigPanel(CardWidget):
         lbl_unique = QLabel("Chính sách chống trùng:")
         lbl_unique.setStyleSheet("font-weight: 500;")
         self.cmb_unique_policy = ComboBox(self)
-        self.cmb_unique_policy.addItem("Chống trùng cả đợt (Unique Batch) [Khuyên dùng]", userData="unique_batch")
-        self.cmb_unique_policy.addItem("Chống trùng từng video (Unique Output)", userData="unique_output")
-        self.cmb_unique_policy.addItem("Bốc có hoàn lại khi hết kho (Cycle Output)", userData="cycle_output")
+        self.cmb_unique_policy.addItem("Không dùng lại đoạn trong cả đợt", userData="unique_batch")
+        self.cmb_unique_policy.addItem("Không dùng lại đoạn trong mỗi video", userData="unique_output")
+        self.cmb_unique_policy.addItem("Cho phép dùng lại đoạn khi hết kho", userData="cycle_output")
         pol_grid.addWidget(lbl_unique, 0, 0)
         pol_grid.addWidget(self.cmb_unique_policy, 0, 1)
 
         lbl_anti = QLabel("Tránh clip cùng nguồn:")
         lbl_anti.setStyleSheet("font-weight: 500;")
         self.cmb_anti_consecutive = ComboBox(self)
-        self.cmb_anti_consecutive.addItem("Tránh liên tiếp nếu có thể — Mềm (Soft) [Khuyên dùng]", userData="soft")
-        self.cmb_anti_consecutive.addItem("Bắt buộc khác nguồn — Nghiêm ngặt (Strict)", userData="strict")
-        self.cmb_anti_consecutive.addItem("Không hạn chế — Tắt (Off)", userData="off")
+        self.cmb_anti_consecutive.addItem("Ưu tiên khác nguồn nếu còn lựa chọn", userData="soft")
+        self.cmb_anti_consecutive.addItem("Luôn khác nguồn ở hai đoạn liền nhau", userData="strict")
+        self.cmb_anti_consecutive.addItem("Không hạn chế thứ tự nguồn", userData="off")
         pol_grid.addWidget(lbl_anti, 1, 0)
         pol_grid.addWidget(self.cmb_anti_consecutive, 1, 1)
 
@@ -183,7 +197,7 @@ class CutConfigPanel(CardWidget):
         self.cmb_anti_consecutive.currentIndexChanged.connect(self._on_anti_consecutive_changed)
 
         self.chk_use_history = QCheckBox(
-            "Loại trừ các đoạn đã từng xuất trong lịch sử (SQLite / export_history)", self
+            "Bỏ qua những đoạn đã xuất trong các lần trước", self
         )
         self.chk_use_history.setChecked(bool(settings.get("use_history", False)))
         self.chk_use_history.stateChanged.connect(self._update_summary)
@@ -192,7 +206,7 @@ class CutConfigPanel(CardWidget):
         # History counter & clear button
         hist_box = QHBoxLayout()
         self.lbl_hist_count = QLabel("Lịch sử: 0 đoạn", self)
-        self.lbl_hist_count.setStyleSheet("color: #666; font-size: 11px;")
+        self.lbl_hist_count.setObjectName("mutedText")
         self.btn_clear_hist = PushButton("Xóa lịch sử", self)
         self.btn_clear_hist.setMaximumHeight(26)
         self.btn_clear_hist.clicked.connect(self._clear_history)
@@ -201,7 +215,9 @@ class CutConfigPanel(CardWidget):
         hist_box.addWidget(self.btn_clear_hist)
         chk_layout.addLayout(hist_box)
 
-        layout.addLayout(chk_layout)
+        advanced_layout.addLayout(chk_layout)
+        layout.addWidget(self.advanced_widget)
+        self.advanced_widget.setVisible(False)
 
         # ── Pool info label (updated by main_window after build) ──────
         self.lbl_pool_info = QLabel("Kho đoạn: Chưa tạo", self)
@@ -382,3 +398,35 @@ class CutConfigPanel(CardWidget):
             unique_policy=u_pol,
             anti_consecutive_policy=a_pol,
         )
+
+    def detach_advanced_settings(self):
+        """Move segmentation and policies into the dedicated settings dialog."""
+        self._guided_compact = True
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        row = QHBoxLayout()
+        row.addWidget(self.segment_caption)
+        row.addWidget(self.spin_seg_dur, 1)
+        layout.addLayout(row)
+        layout.addWidget(self.advanced_widget)
+        self.advanced_widget.setVisible(True)
+        self.btn_advanced.hide()
+        self.lbl_summary.hide()
+        self.lbl_pool_info.hide()
+        self._advanced_settings_box = box
+        return box
+
+    def set_audio_only(self, audio_only: bool):
+        if getattr(self, '_guided_compact', False):
+            self._advanced_settings_box.setEnabled(not audio_only)
+            self.batch_caption.setText("Số lượng tệp:" if audio_only else "Số lượng video:")
+            self.spin_batch_count.setSuffix(" tệp" if audio_only else " video")
+            return
+        self.segment_caption.setVisible(not audio_only)
+        self.spin_seg_dur.setVisible(not audio_only)
+        self.lbl_summary.setVisible(not audio_only)
+        self.btn_advanced.setVisible(not audio_only)
+        self.advanced_widget.setVisible(not audio_only and self.btn_advanced.isChecked())
+        self.lbl_pool_info.setVisible(not audio_only)
+        self.batch_caption.setText("Số lượng tệp âm thanh:" if audio_only else "Số lượng video:")
+        self.spin_batch_count.setSuffix(" tệp" if audio_only else " video")

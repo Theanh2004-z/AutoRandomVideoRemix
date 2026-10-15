@@ -70,6 +70,10 @@ from ui.components.output_config_panel import OutputConfigPanel
 from ui.components.progress_panel import ProgressPanel
 from ui.components.cut_table_view import CutTableView
 from ui.styles import GLOBAL_STYLE_SHEET
+from ui.workflow import GuidedWorkflow
+from core.settings_manager import settings
+from core.render_cache import RenderCache
+from core.app_paths import get_cache_dir
 
 
 class MainWindow(QMainWindow):
@@ -77,9 +81,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TOOL TỰ ĐỘNG CHIA & GHÉP VIDEO + ÂM THANH NGẪU NHIÊN - v2.5")
-        self.resize(1300, 880)
-        self.setMinimumSize(1024, 700)
+        self.setWindowTitle("AutoRandomVideoRemix — Tạo nội dung từ kho của bạn")
+        self.resize(1320, 900)
+        self.setMinimumSize(1100, 740)
         self.setStyleSheet(GLOBAL_STYLE_SHEET)
 
         # ── Application state ──────────────────────────────────────────
@@ -89,89 +93,55 @@ class MainWindow(QMainWindow):
         self.audio_pool: Optional[AudioPool] = None
         self.current_audio_playlists: List[List[AudioPlaylistItem]] = []
         self.worker: Optional[VideoProcessorWorker] = None
+        self._closing_requested = False
         self._pending_start_export: bool = False
         self._plan_is_stale: bool = True
         self._plan_revision: int = 0
 
+        # ── Theme restoration ──────────────────────────────────────────
+        saved_theme = settings.get("theme", "dark")
+        if Theme is not None:
+            if saved_theme == "light":
+                setTheme(Theme.LIGHT)
+            else:
+                setTheme(Theme.DARK)
+
         self._init_ui()
         self._connect_signals()
+        self.workflow.bind()
+
+        # Schedule automatic restoration of source directories on startup
+        QTimer.singleShot(250, self._auto_restore_sessions)
 
     # ------------------------------------------------------------------
     # UI setup
     # ------------------------------------------------------------------
 
     def _init_ui(self):
-        central_widget = QWidget(self)
-        self.setCentralWidget(central_widget)
-        main_vbox = QVBoxLayout(central_widget)
-        main_vbox.setContentsMargins(16, 12, 16, 16)
-        main_vbox.setSpacing(12)
-
-        # Top header bar
-        header_bar = QHBoxLayout()
-        header_title = QLabel("🎬 TOOL TỰ ĐỘNG CHIA & GHÉP VIDEO NGẪU NHIÊN")
-        header_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0078D4;")
-
-        header_sub = QLabel("— Chia tuần tự → Kho đoạn → Xáo trộn → Bốc ngẫu nhiên → Ghép MP4")
-        header_sub.setStyleSheet("font-size: 12px; color: #777;")
-
-        header_bar.addWidget(header_title)
-        header_bar.addWidget(header_sub)
-        header_bar.addStretch()
-
-        self.btn_theme = PushButton("🌓 Đổi Giao Diện", self)
-        self.btn_theme.clicked.connect(self._toggle_theme)
-        header_bar.addWidget(self.btn_theme)
-        main_vbox.addLayout(header_bar)
-
-        # Main splitter (Left: Config & Source / Right: Monitor & Table)
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.setChildrenCollapsible(False)
-
-        # Left column: scroll area for config panels
-        left_scroll = QScrollArea(self)
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QScrollArea.NoFrame)
-
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 8, 0)
-        left_layout.setSpacing(14)
-
-        self.source_panel = SourcePanel(left_container)
-        left_layout.addWidget(self.source_panel)
-
-        self.audio_panel = AudioPanel(left_container)
-        left_layout.addWidget(self.audio_panel)
-
-        self.cut_panel = CutConfigPanel(left_container)
-        left_layout.addWidget(self.cut_panel)
-
-        self.output_panel = OutputConfigPanel(left_container)
-        left_layout.addWidget(self.output_panel)
-
-        left_layout.addStretch()
-        left_scroll.setWidget(left_container)
-        splitter.addWidget(left_scroll)
-
-        # Right column: progress + table
-        right_container = QWidget(self)
-        right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(8, 0, 0, 0)
-        right_layout.setSpacing(14)
-
-        self.progress_panel = ProgressPanel(right_container)
-        right_layout.addWidget(self.progress_panel)
-
-        self.table_view = CutTableView(right_container)
-        right_layout.addWidget(self.table_view, 1)
-
-        splitter.addWidget(right_container)
-        splitter.setSizes([560, 680])
-        main_vbox.addWidget(splitter, 1)
+        self.workflow = GuidedWorkflow(self)
+        self.setCentralWidget(self.workflow)
+        if Theme is not None:
+            self.workflow.apply_theme(isDarkTheme())
 
     def _toggle_theme(self):
-        setTheme(Theme.LIGHT if isDarkTheme() else Theme.DARK)
+        new_is_dark = not isDarkTheme()
+        if Theme is not None:
+            setTheme(Theme.DARK if new_is_dark else Theme.LIGHT)
+        settings.set("theme", "dark" if new_is_dark else "light")
+        self.workflow.apply_theme(new_is_dark)
+
+    def _auto_restore_sessions(self):
+        """Restores video and audio sources if previously configured folders exist."""
+        vid_dir = settings.get("video_folder", "").strip()
+        if vid_dir and os.path.isdir(vid_dir) and not self.source_videos:
+            self.progress_panel.log("INFO", f"📂 Tự động khôi phục video từ: {vid_dir}")
+            self.source_panel._start_scan()
+
+        aud_dir = settings.get("audio_folder", "").strip()
+        if aud_dir and os.path.isdir(aud_dir) and (not self.audio_pool or self.audio_pool.total_tracks == 0):
+            self.progress_panel.log("INFO", f"🎵 Tự động khôi phục âm thanh từ: {aud_dir}")
+            self.audio_panel._start_scan()
+
 
     # ------------------------------------------------------------------
     # Signal wiring
@@ -298,7 +268,7 @@ class MainWindow(QMainWindow):
             playlists = planner.plan_batch(batch_count=batch_count, target_duration=target_dur)
             self.current_audio_playlists = playlists
             if playlists:
-                self.table_view.set_audio_playlist(playlists[0])
+                self.table_view.set_audio_playlists(playlists)
             self._plan_is_stale = False
             tot_tracks = sum(len(p) for p in playlists)
             self.progress_panel.log(
@@ -522,7 +492,7 @@ class MainWindow(QMainWindow):
         # Reset used state in pool
         self.pool.reset_used()
 
-        v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg)
+        v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg, fps=self.output_panel.get_config().fps)
 
         # 1. Convert master pool segments to catalog segments with content-based asset_id (V01, V03)
         all_catalog_segs = self._convert_segments_to_catalog(self.pool.master_pool, fps=v3_cut_cfg.fps)
@@ -574,7 +544,7 @@ class MainWindow(QMainWindow):
                 if cut_cfg.batch_count > 1:
                     self.cut_panel.chk_no_repeat_batch.setChecked(False)
                 cut_cfg = self.cut_panel.get_config()
-                v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg)
+                v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg, fps=self.output_panel.get_config().fps)
                 planner = ExportPlanner(
                     video_segments=catalog_segs,
                     audio_tracks=audio_tracks,
@@ -616,10 +586,24 @@ class MainWindow(QMainWindow):
         self.worker.video_completed.connect(self._on_worker_video_completed)
         self.worker.batch_finished.connect(self._on_worker_batch_finished)
         self.worker.error_occurred.connect(self._on_worker_error)
+        if hasattr(self, "workflow"):
+            self.workflow.attach_worker(self.worker)
 
     def _on_start_rendering(self):
         """Stage 6–7: Render all planned videos / audio with 1-Click Auto-Preparation."""
+        if self.worker and self.worker.isRunning():
+            return
+        if hasattr(self, "workflow") and not self.workflow.validated():
+            self.workflow.go_to(2)
+            self.progress_panel.log("WARNING", "Cần kiểm tra và lập kế hoạch trước khi xuất.")
+            return
+        history_repo = None
+        job_id = None
         try:
+            self.render_cache = RenderCache(
+                cache_dir=settings.get('cache_folder','') or get_cache_dir(),
+                max_size_bytes=int(settings.get('cache_max_gb',5))*1024**3,
+                enabled=bool(settings.get('cache_enabled',True)))
             export_target = self.audio_panel.get_export_target()
             out_cfg = self.output_panel.get_config()
             out_cfg.export_target = export_target
@@ -820,7 +804,7 @@ class MainWindow(QMainWindow):
 
                 self.current_audio_playlists = audio_playlists_to_send
                 if audio_playlists_to_send:
-                    self.table_view.set_audio_playlist(audio_playlists_to_send[0])
+                    self.table_view.set_audio_playlists(audio_playlists_to_send)
                     self.progress_panel.log(
                         "INFO",
                         f"✓ Đã chuẩn bị {len(audio_playlists_to_send[0])} bài nhạc ngẫu nhiên cho video bằng ExportPlanner (V3)."
@@ -837,6 +821,7 @@ class MainWindow(QMainWindow):
                 render_cache=getattr(self, "render_cache", None),
                 job_id=job_id,
                 history_repo=history_repo,
+                source_metadata={video.path:video for video in self.source_videos},
                 parent=self
             )
             self._connect_worker_signals()
@@ -944,29 +929,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        is_running = bool(self.worker and self.worker.isRunning())
-        if is_running:
-            reply = QMessageBox.question(
-                self,
-                "Xác nhận đóng",
-                "Đang có tiến trình render đang chạy. Bạn có chắc muốn hủy và thoát không?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                if self.worker:
-                    self.worker.cancel()
-                    self.worker.wait(3000)
-                if hasattr(self.source_panel, "scanner_thread") and self.source_panel.scanner_thread and self.source_panel.scanner_thread.isRunning():
-                    self.source_panel.scanner_thread.terminate()
-                if hasattr(self.audio_panel, "scanner_thread") and self.audio_panel.scanner_thread and self.audio_panel.scanner_thread.isRunning():
-                    self.audio_panel.scanner_thread.terminate()
-                event.accept()
-            else:
+        rendering = bool(self.worker and self.worker.isRunning())
+        if rendering and not self._closing_requested:
+            reply = QMessageBox.question(self,"Đóng ứng dụng",
+                "Đang xuất nội dung. Hủy công việc và đóng ứng dụng?",
+                QMessageBox.Yes | QMessageBox.No,QMessageBox.No)
+            if reply != QMessageBox.Yes:
                 event.ignore()
-        else:
-            if hasattr(self.source_panel, "scanner_thread") and self.source_panel.scanner_thread and self.source_panel.scanner_thread.isRunning():
-                self.source_panel.scanner_thread.terminate()
-            if hasattr(self.audio_panel, "scanner_thread") and self.audio_panel.scanner_thread and self.audio_panel.scanner_thread.isRunning():
-                self.audio_panel.scanner_thread.terminate()
-            event.accept()
+                return
+        self._closing_requested = True
+        self.workflow.stop_background()
+        if rendering:
+            self.worker.cancel()
+        if rendering or self.workflow.background_running():
+            event.ignore()
+            self.workflow.state_label.setText("Đang dừng tác vụ…")
+            QTimer.singleShot(100,self.close)
+            return
+        self.workflow.settings_dialog.close()
+        event.accept()

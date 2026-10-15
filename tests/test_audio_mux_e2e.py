@@ -120,7 +120,7 @@ class TestAudioMuxE2E(unittest.TestCase):
 
             # 2. Area C combo_audio should be disabled with status message
             self.assertFalse(w.output_panel.combo_audio.isEnabled())
-            self.assertIn("Kho nhạc ngẫu nhiên", w.output_panel.lbl_audio_status.text())
+            self.assertIn("thư mục âm thanh", w.output_panel.lbl_audio_status.text())
 
             # 3. Switching to video_only in AudioPanel should re-enable combo_audio
             w.audio_panel.combo_export_target.setCurrentIndex(2)

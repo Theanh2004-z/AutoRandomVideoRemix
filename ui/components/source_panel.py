@@ -4,53 +4,34 @@ Allows picking folder, scanning video files, showing statistics and file list.
 """
 import os
 from typing import List, Tuple
-from PySide6.QtCore import Qt, Signal, QThread, QTimer
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog,
-    QHeaderView, QTableWidgetItem, QFrame, QCheckBox
+    QHeaderView, QTableWidgetItem, QFrame, QToolButton, QCheckBox
 )
 from qfluentwidgets import (
     CardWidget, PushButton, PrimaryPushButton, LineEdit,
     TableWidget, ProgressBar, InfoBar, InfoBarPosition
 )
 from core.config import VideoInfo
-from core.video_scanner import scan_directory
 from core.settings_manager import settings
-
-
-class ScannerThread(QThread):
-    progress = Signal(int, int, str)
-    finished_scan = Signal(list, list)
-
-    def __init__(self, folder: str, recursive: bool, parent=None):
-        super().__init__(parent)
-        self.folder = folder
-        self.recursive = recursive
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def run(self):
-        valid, invalid = scan_directory(
-            directory=self.folder,
-            recursive=self.recursive,
-            progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name),
-            cancel_check=lambda: self._cancelled
-        )
-        self.finished_scan.emit(valid, invalid)
+from ui.auto_scan import AutoScanController
+from ui.background import MediaScanWorker
 
 
 class SourcePanel(CardWidget):
     """Area A: Source Videos Management."""
+    scan_started = Signal()
+    scan_state_changed = Signal(bool)
     videos_scanned = Signal(list)  # List[VideoInfo]
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.valid_videos: List[VideoInfo] = []
         self.invalid_videos: List[VideoInfo] = []
-        self.scanner_thread: ScannerThread = None
+        self.scanner_thread: MediaScanWorker = None
         self._init_ui()
+        self.auto_scan = AutoScanController(self, "video")
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -59,7 +40,7 @@ class SourcePanel(CardWidget):
 
         # Header
         header_layout = QHBoxLayout()
-        title = QLabel("KHU VỰC A: THƯ MỤC VIDEO NGUỒN")
+        title = QLabel("Video nguồn")
         title.setObjectName("sectionHeader")
         header_layout.addWidget(title)
         header_layout.addStretch()
@@ -79,7 +60,7 @@ class SourcePanel(CardWidget):
         self.btn_browse = PushButton("Chọn thư mục...", self)
         self.btn_browse.clicked.connect(self._choose_folder)
 
-        self.btn_scan = PrimaryPushButton("Quét video", self)
+        self.btn_scan = PushButton("Kiểm tra lại", self)
         self.btn_scan.clicked.connect(self._start_scan)
 
         folder_layout.addWidget(self.folder_edit, 1)
@@ -100,6 +81,8 @@ class SourcePanel(CardWidget):
         self.scan_bar = ProgressBar(self)
         self.scan_bar.setVisible(False)
         self.scan_status_lbl = QLabel("", self)
+        self.scan_status_lbl.setWordWrap(True)
+        self.scan_status_lbl.setObjectName("mutedText")
         self.scan_status_lbl.setVisible(False)
         layout.addWidget(self.scan_bar)
         layout.addWidget(self.scan_status_lbl)
@@ -134,15 +117,18 @@ class SourcePanel(CardWidget):
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.setMinimumHeight(140)
         self.table.setMaximumHeight(200)
+        self.btn_details = QToolButton(self)
+        self.btn_details.setText("Xem danh sách video")
+        self.btn_details.setCheckable(True)
+        self.btn_details.toggled.connect(self.table.setVisible)
+        layout.addWidget(self.btn_details)
+        table_lbl.setVisible(False)
+        self.table.setVisible(False)
         layout.addWidget(self.table)
-
-        # Auto-scan on startup if saved directory exists
-        if saved_folder and os.path.isdir(saved_folder):
-            QTimer.singleShot(250, self._start_scan)
 
     def _create_stat_card(self, num_text: str, label_text: str) -> QFrame:
         card = QFrame(self)
-        card.setStyleSheet("background-color: #F8F9FA; border: 1px solid #E5E5E5; border-radius: 6px; padding: 6px;")
+        card.setProperty("statCard", True)
         l = QVBoxLayout(card)
         l.setContentsMargins(8, 6, 8, 6)
         l.setSpacing(2)
@@ -166,30 +152,9 @@ class SourcePanel(CardWidget):
         chosen = QFileDialog.getExistingDirectory(self, "Chọn thư mục video nguồn", start_dir)
         if chosen:
             self.folder_edit.setText(chosen)
-            self._start_scan()
 
     def _start_scan(self):
-        folder = self.folder_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
-            InfoBar.error(
-                title="Lỗi thư mục",
-                content="Vui lòng chọn một thư mục video nguồn hợp lệ trên máy tính!",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
-            return
-
-        self.btn_scan.setEnabled(False)
-        self.btn_browse.setEnabled(False)
-        self.scan_bar.setVisible(True)
-        self.scan_bar.setValue(0)
-        self.scan_status_lbl.setVisible(True)
-        self.scan_status_lbl.setText("Đang tìm kiếm file video...")
-
-        self.scanner_thread = ScannerThread(folder, self.chk_recursive.isChecked(), self)
-        self.scanner_thread.progress.connect(self._on_scan_progress)
-        self.scanner_thread.finished_scan.connect(self._on_scan_finished)
-        self.scanner_thread.start()
+        self.auto_scan.start()
 
     def _on_scan_progress(self, current: int, total: int, filename: str):
         if total > 0:
@@ -236,20 +201,8 @@ class SourcePanel(CardWidget):
 
         self.update_estimated_segments()
 
-        if valid:
-            InfoBar.success(
-                title="Quét hoàn tất",
-                content=f"Tìm thấy {len(valid)} video hợp lệ (Tổng: {dur_str}).",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
-        else:
-            InfoBar.warning(
-                title="Không tìm thấy video",
-                content="Không có video hợp lệ nào trong thư mục đã chọn.",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
+        self.scan_status_lbl.setVisible(True)
+        self.scan_status_lbl.setText(f"Đã kiểm tra {len(valid)} tệp hợp lệ · {len(invalid)} tệp bỏ qua.")
 
         self.videos_scanned.emit(valid)
 
@@ -259,9 +212,10 @@ class SourcePanel(CardWidget):
             self.stat_segments_card.val_lbl.setText("0")
             return
         try:
-            from core.segment_slicer import SegmentSlicer
-            slicer = SegmentSlicer(segment_duration=segment_dur, merge_remainder=merge_remainder)
-            total_segs = sum(len(slicer.slice(v)) for v in self.valid_videos)
+            import math
+            total_segs = sum(max(1, math.floor(v.duration / segment_dur) if merge_remainder else
+                                 math.ceil(v.duration / segment_dur))
+                             for v in self.valid_videos if v.is_valid and v.duration > 0)
             self.stat_segments_card.val_lbl.setText(str(total_segs))
         except Exception:
             self.stat_segments_card.val_lbl.setText("0")

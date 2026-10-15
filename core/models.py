@@ -4,7 +4,7 @@ Defines normalized immutable configuration structures and provides
 backward compatibility adapters for V2.5 configuration objects.
 """
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 import hashlib
 import os
 
@@ -18,7 +18,8 @@ _CONTENT_HASH_CACHE: Dict[Tuple[str, float, int], str] = {}
 def compute_media_content_hash(
     file_path: str,
     file_size: Optional[int] = None,
-    allow_cache: bool = True
+    allow_cache: bool = True,
+    cancel_check: Optional[Callable[[], bool]] = None
 ) -> str:
     """
     Computes an authoritative content-based SHA-256 fingerprint by streaming
@@ -45,8 +46,12 @@ def compute_media_content_hash(
     try:
         with open(abs_p, "rb") as f:
             while chunk := f.read(256 * 1024):
+                if cancel_check and cancel_check():
+                    raise InterruptedError("Media preparation cancelled")
                 h.update(chunk)
         digest = h.hexdigest()[:16]
+    except InterruptedError:
+        raise
     except Exception:
         digest = hashlib.sha256(f"{abs_p}::{size}::{mtime}".encode("utf-8")).hexdigest()[:16]
 

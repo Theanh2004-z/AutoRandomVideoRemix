@@ -40,6 +40,10 @@ class VideoInfo:
     size_bytes: int
     is_valid: bool = True
     error_msg: str = ""
+    pixel_format: str = ""
+    color_transfer: str = ""
+    sample_aspect_ratio: str = "1:1"
+    time_base: str = ""
 
     @property
     def formatted_duration(self) -> str:
@@ -231,6 +235,10 @@ class OutputConfig:
     output_dir: str = ""
     output_prefix: str = ""  # Empty string defaults to daily date MMDD (e.g. 1014.mp4, 1014(0).mp4)
     audio_output_format: str = "mp3"  # 'mp3' | 'wav' | 'm4a'
+    render_speed: str = "balanced"  # fast | balanced | quality
+    parallel_segments: int = 0       # 0=auto, 1 or 2
+    gpu_processing: bool = True      # hardware decode/scale when compatible
+    decoder_mode: str = "auto"       # auto | gpu | cpu
 
     @property
     def width_height(self) -> tuple[int, int]:

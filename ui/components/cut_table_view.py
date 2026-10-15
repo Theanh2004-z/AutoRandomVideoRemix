@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QHeaderView, QTableWidgetItem, QTabWidget
 )
-from qfluentwidgets import CardWidget, TableWidget, ComboBox
+from qfluentwidgets import CardWidget, TableWidget, ComboBox, PushButton
 
 from core.config import SegmentInfo, AudioPlaylistItem
 
@@ -25,6 +25,10 @@ class CutTableView(CardWidget):
         super().__init__(parent)
         self._pool_segments: List[SegmentInfo] = []
         self._batch_plans: List[List[SegmentInfo]] = []
+        self._page_offsets = {'pool':0,'plan':0,'audio':0}
+        self._pagers = {}
+        self._audio_playlists = []
+        self._audio_playlist = []
         self._init_ui()
 
     # ------------------------------------------------------------------
@@ -38,7 +42,7 @@ class CutTableView(CardWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("KHU VỰC F: KHO ĐOẠN & KẾ HOẠCH GHÉP")
+        title = QLabel("Nội dung trong kế hoạch")
         title.setObjectName("sectionHeader")
         header.addWidget(title)
         layout.addLayout(header)
@@ -46,6 +50,7 @@ class CutTableView(CardWidget):
         # Tab widget
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setDrawBase(False)
 
         # ── Tab 1: Pool ───────────────────────────────────────────────
         self.pool_tab = QWidget()
@@ -65,8 +70,9 @@ class CutTableView(CardWidget):
         self._configure_header(self.pool_table, stretch_col=1)
         self.pool_table.setMinimumHeight(160)
         pool_layout.addWidget(self.pool_table)
+        self._add_pager(pool_layout,'pool',self._display_pool)
 
-        self.tabs.addTab(self.pool_tab, "📦  Kho đoạn")
+        self.tabs.addTab(self.pool_tab, "Kho đoạn")
 
         # ── Tab 2: Plan ───────────────────────────────────────────────
         self.plan_tab = QWidget()
@@ -97,8 +103,9 @@ class CutTableView(CardWidget):
         self._configure_header(self.plan_table, stretch_col=1)
         self.plan_table.setMinimumHeight(160)
         plan_layout.addWidget(self.plan_table)
+        self._add_pager(plan_layout,'plan',lambda: self._display_plan(self.combo_target_video.currentIndex()))
 
-        self.tabs.addTab(self.plan_tab, "🎬  Kế hoạch ghép")
+        self.tabs.addTab(self.plan_tab, "Kế hoạch video")
 
         # ── Tab 3: Audio Playlist ─────────────────────────────────────
         self.audio_tab = QWidget()
@@ -110,7 +117,13 @@ class CutTableView(CardWidget):
             "Chưa có playlist âm thanh. Nhấn 'Tạo playlist nhạc' để lập danh sách.", self
         )
         self.lbl_audio_summary.setStyleSheet("color: #666; font-style: italic;")
-        audio_layout.addWidget(self.lbl_audio_summary)
+        audio_header = QHBoxLayout()
+        self.lbl_audio_summary.setWordWrap(True)
+        audio_header.addWidget(self.lbl_audio_summary,1)
+        self.combo_audio_output = ComboBox(self.audio_tab)
+        self.combo_audio_output.currentIndexChanged.connect(self._on_audio_output_selected)
+        audio_header.addWidget(self.combo_audio_output)
+        audio_layout.addLayout(audio_header)
 
         self.audio_table = TableWidget(self.audio_tab)
         self.audio_table.setColumnCount(6)
@@ -120,10 +133,42 @@ class CutTableView(CardWidget):
         self._configure_header(self.audio_table, stretch_col=1)
         self.audio_table.setMinimumHeight(160)
         audio_layout.addWidget(self.audio_table)
+        self._add_pager(audio_layout,'audio',self._display_audio)
 
-        self.tabs.addTab(self.audio_tab, "🎵  Playlist Âm thanh")
+        self.tabs.addTab(self.audio_tab, "Playlist nhạc")
 
         layout.addWidget(self.tabs, 1)
+
+    def _add_pager(self, layout, key, render):
+        widget = QWidget(self)
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0,0,0,0)
+        before, after = PushButton('Trang trước',widget), PushButton('Trang sau',widget)
+        caption = QLabel('',widget)
+        caption.setObjectName('mutedText')
+        before.clicked.connect(lambda: self._turn_page(key,-1,render))
+        after.clicked.connect(lambda: self._turn_page(key,1,render))
+        row.addWidget(caption,1)
+        row.addWidget(before)
+        row.addWidget(after)
+        self._pagers[key] = (widget,caption,before,after)
+        layout.addWidget(widget)
+        widget.hide()
+
+    def _turn_page(self,key,direction,render):
+        self._page_offsets[key] = max(0,self._page_offsets[key]+direction*200)
+        render()
+
+    def _page(self,key,items):
+        start = min(self._page_offsets[key],max(0,((len(items)-1)//200)*200))
+        self._page_offsets[key] = start
+        end = min(len(items),start+200)
+        widget,caption,before,after = self._pagers[key]
+        widget.setVisible(len(items)>200)
+        caption.setText(f'{start+1}–{end} / {len(items)} dòng')
+        before.setEnabled(start>0)
+        after.setEnabled(end<len(items))
+        return items[start:end]
 
     def _configure_header(self, table: TableWidget, stretch_col: int):
         hdr = table.horizontalHeader()
@@ -151,20 +196,23 @@ class CutTableView(CardWidget):
         )
         self.lbl_pool_summary.setStyleSheet("color: #0078D4; font-weight: 600;")
 
+        self._page_offsets['pool'] = 0
+        self._display_pool()
+        self.tabs.setCurrentIndex(0)
+
+    def _display_pool(self):
+        entries = self._page('pool',self._pool_segments)
         self.pool_table.setUpdatesEnabled(False)
         try:
-            self.pool_table.setRowCount(total)
-            for row, seg in enumerate(segments):
-                self._render_pool_row(row, seg)
+            self.pool_table.setRowCount(len(entries))
+            for row,seg in enumerate(entries):
+                self._render_pool_row(row,seg)
         finally:
             self.pool_table.setUpdatesEnabled(True)
 
-        # Auto-switch to pool tab to show the result
-        self.tabs.setCurrentIndex(0)
-
     def _render_pool_row(self, row: int, seg: SegmentInfo):
         items = [
-            (f"#{row + 1}", Qt.AlignCenter),
+            (f"#{row + 1 + self._page_offsets['pool']}", Qt.AlignCenter),
             (seg.source_video_name, Qt.AlignLeft),
             (seg.formatted_start, Qt.AlignCenter),
             (seg.formatted_end, Qt.AlignCenter),
@@ -185,7 +233,7 @@ class CutTableView(CardWidget):
         """Re-render the 'Đã dùng?' column after picking updates is_used flags."""
         self.pool_table.setUpdatesEnabled(False)
         try:
-            for row, seg in enumerate(self._pool_segments):
+            for row, seg in enumerate(self._page("pool",self._pool_segments)):
                 if row >= self.pool_table.rowCount():
                     break
                 used_item = QTableWidgetItem("✓ Đã dùng" if seg.is_used else "—")
@@ -202,6 +250,7 @@ class CutTableView(CardWidget):
     def set_plans(self, plans: List[List[SegmentInfo]]):
         """Populate the plan tab with a batch of output video plans."""
         self._batch_plans = plans
+        self._page_offsets["plan"] = 0
 
         self.combo_target_video.blockSignals(True)
         self.combo_target_video.clear()
@@ -228,11 +277,13 @@ class CutTableView(CardWidget):
         self.combo_target_video.clear()
         self.combo_target_video.blockSignals(False)
         self.plan_table.setRowCount(0)
-        self.lbl_plan_summary.setText("⚠️ Cấu hình đã đổi — Kế hoạch cũ đã hết hạn. Hãy nhấn 'Xem trước kế hoạch' để tạo lại.")
+        self.lbl_plan_summary.setText("Kế hoạch cũ đã hết hạn. Kế hoạch mới sẽ tự chuẩn bị trong nền.")
+        self.set_audio_playlists([])
         self.lbl_plan_summary.setStyleSheet("color: #D83B01; font-style: italic;")
 
     def _on_plan_video_selected(self, index: int):
         if 0 <= index < len(self._batch_plans):
+            self._page_offsets["plan"] = 0
             self._display_plan(index)
 
     def _display_plan(self, plan_idx: int):
@@ -251,8 +302,9 @@ class CutTableView(CardWidget):
 
         self.plan_table.setUpdatesEnabled(False)
         try:
-            self.plan_table.setRowCount(len(plan))
-            for row, seg in enumerate(plan):
+            entries = self._page("plan",plan)
+            self.plan_table.setRowCount(len(entries))
+            for row, seg in enumerate(entries):
                 self._render_plan_row(row, seg)
         finally:
             self.plan_table.setUpdatesEnabled(True)
@@ -295,7 +347,7 @@ class CutTableView(CardWidget):
                     break
 
             if self.combo_target_video.currentIndex() == plan_i:
-                row = plan_position - 1
+                row = plan_position - 1 - self._page_offsets["plan"]
                 if 0 <= row < self.plan_table.rowCount():
                     status_item = QTableWidgetItem(new_status)
                     status_item.setTextAlignment(Qt.AlignCenter)
@@ -314,7 +366,24 @@ class CutTableView(CardWidget):
 
     def set_audio_playlist(self, playlist: List[AudioPlaylistItem]):
         """Populate the audio playlist tab with selected tracks."""
-        self._audio_playlist = list(playlist)
+        self.set_audio_playlists([playlist] if playlist else [])
+
+    def set_audio_playlists(self, playlists):
+        self._audio_playlists = playlists
+        self.combo_audio_output.blockSignals(True)
+        self.combo_audio_output.clear()
+        for index in range(len(playlists)):
+            self.combo_audio_output.addItem(f'Đầu ra #{index+1}', userData=index)
+        self.combo_audio_output.blockSignals(False)
+        self._on_audio_output_selected(0)
+
+    def _on_audio_output_selected(self,index):
+        self._page_offsets['audio'] = 0
+        self._audio_playlist = self._audio_playlists[index] if 0 <= index < len(self._audio_playlists) else []
+        self._display_audio()
+
+    def _display_audio(self):
+        playlist = self._audio_playlist
         total = len(playlist)
         tot_eff = sum(p.effective_duration for p in playlist)
         m, s = divmod(int(tot_eff), 60)
@@ -325,8 +394,9 @@ class CutTableView(CardWidget):
 
         self.audio_table.setUpdatesEnabled(False)
         try:
-            self.audio_table.setRowCount(total)
-            for row, item in enumerate(playlist):
+            entries = self._page("audio",playlist)
+            self.audio_table.setRowCount(len(entries))
+            for row, item in enumerate(entries):
                 self._render_audio_row(row, item)
         finally:
             self.audio_table.setUpdatesEnabled(True)
@@ -336,7 +406,7 @@ class CutTableView(CardWidget):
     def _render_audio_row(self, row: int, item: AudioPlaylistItem):
         cut_desc = " ✂ [Cắt cuối]" if item.is_trimmed else ""
         items = [
-            (f"#{row + 1}", Qt.AlignCenter),
+            (f"#{row + 1 + self._page_offsets['audio']}", Qt.AlignCenter),
             (item.source_audio_name, Qt.AlignLeft | Qt.AlignVCenter),
             (item.formatted_original, Qt.AlignCenter),
             (f"{item.formatted_effective}{cut_desc}", Qt.AlignCenter),

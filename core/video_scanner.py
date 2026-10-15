@@ -61,7 +61,7 @@ def probe_video_file(file_path: str) -> VideoInfo:
         "ffprobe",
         "-v", "error",
         "-show_entries",
-        "stream=width,height,r_frame_rate,avg_frame_rate,codec_name,duration,codec_type"
+        "stream=width,height,r_frame_rate,avg_frame_rate,codec_name,duration,codec_type,pix_fmt,color_transfer,sample_aspect_ratio,time_base"
         ":format=duration",
         "-of", "json",
         file_path
@@ -167,7 +167,11 @@ def probe_video_file(file_path: str) -> VideoInfo:
             codec=codec,
             has_audio=has_audio,
             size_bytes=size_bytes,
-            is_valid=True
+            is_valid=True,
+            pixel_format=v_stream.get("pix_fmt", ""),
+            color_transfer=v_stream.get("color_transfer", ""),
+            sample_aspect_ratio=v_stream.get("sample_aspect_ratio", "1:1"),
+            time_base=v_stream.get("time_base", "")
         )
 
     except subprocess.TimeoutExpired:

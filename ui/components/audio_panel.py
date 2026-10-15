@@ -5,7 +5,7 @@ and standalone audio export option.
 """
 import os
 from typing import List, Optional
-from PySide6.QtCore import Qt, Signal, QThread, QTimer
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog,
     QHeaderView, QTableWidgetItem, QFrame, QCheckBox, QRadioButton, QButtonGroup
@@ -15,35 +15,15 @@ from qfluentwidgets import (
     ProgressBar, InfoBar, InfoBarPosition, ComboBox
 )
 from core.config import AudioInfo, AudioConfig
-from core.audio_scanner import scan_audio_directory
 from core.settings_manager import settings
-
-
-class AudioScannerThread(QThread):
-    progress = Signal(int, int, str)
-    finished_scan = Signal(list, list)
-
-    def __init__(self, folder: str, recursive: bool, parent=None):
-        super().__init__(parent)
-        self.folder = folder
-        self.recursive = recursive
-        self._cancelled = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def run(self):
-        valid, invalid = scan_audio_directory(
-            directory=self.folder,
-            recursive=self.recursive,
-            progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name),
-            cancel_check=lambda: self._cancelled
-        )
-        self.finished_scan.emit(valid, invalid)
+from ui.auto_scan import AutoScanController
+from ui.background import MediaScanWorker
 
 
 class AudioPanel(CardWidget):
     """Part 2: Audio Source & Random Playlist Configuration Panel."""
+    scan_started = Signal()
+    scan_state_changed = Signal(bool)
     audios_scanned = Signal(list)            # List[AudioInfo]
     shuffle_audio_requested = Signal()
     config_changed = Signal()
@@ -52,8 +32,13 @@ class AudioPanel(CardWidget):
         super().__init__(parent)
         self.valid_audios: List[AudioInfo] = []
         self.invalid_audios: List[AudioInfo] = []
-        self.scanner_thread: Optional[AudioScannerThread] = None
+        self.scanner_thread: Optional[MediaScanWorker] = None
         self._init_ui()
+        self.auto_scan = AutoScanController(self, "audio")
+        self.combo_mode.currentIndexChanged.connect(lambda *args: self.config_changed.emit())
+        self.combo_audio_format.currentIndexChanged.connect(lambda *args: self.config_changed.emit())
+        self.chk_no_consecutive.stateChanged.connect(lambda *args: self.config_changed.emit())
+        self.chk_auto_reshuffle.stateChanged.connect(lambda *args: self.config_changed.emit())
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -62,7 +47,7 @@ class AudioPanel(CardWidget):
 
         # Header
         header = QHBoxLayout()
-        title = QLabel("🎵 PHẦN 2: KHO ÂM THANH NGẪU NHIÊN")
+        title = QLabel("Âm thanh nguồn")
         title.setObjectName("sectionHeader")
         header.addWidget(title)
         header.addStretch()
@@ -82,7 +67,7 @@ class AudioPanel(CardWidget):
         self.btn_browse = PushButton("Chọn thư mục...", self)
         self.btn_browse.clicked.connect(self._choose_folder)
 
-        self.btn_scan = PrimaryPushButton("Quét âm thanh", self)
+        self.btn_scan = PushButton("Kiểm tra lại", self)
         self.btn_scan.clicked.connect(self._start_scan)
 
         folder_box.addWidget(self.folder_edit, 1)
@@ -103,6 +88,8 @@ class AudioPanel(CardWidget):
         self.scan_bar = ProgressBar(self)
         self.scan_bar.setVisible(False)
         self.scan_status_lbl = QLabel("", self)
+        self.scan_status_lbl.setWordWrap(True)
+        self.scan_status_lbl.setObjectName("mutedText")
         self.scan_status_lbl.setVisible(False)
         layout.addWidget(self.scan_bar)
         layout.addWidget(self.scan_status_lbl)
@@ -118,42 +105,50 @@ class AudioPanel(CardWidget):
         stats_layout.addWidget(self.stat_duration_card)
         layout.addLayout(stats_layout)
 
+        self.options_widget = QWidget(self)
+        options_layout = QVBoxLayout(self.options_widget)
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.setSpacing(12)
         # Audio Shuffle & Playback Rules
-        sep = QLabel("Tùy chọn xáo trộn & ghép nối tiếp:")
-        sep.setStyleSheet("font-weight: 600; color: #444; margin-top: 4px;")
-        layout.addWidget(sep)
+        sep = QLabel("Các bài được giữ nguyên trong mỗi lượt; ứng dụng chỉ cắt bài cuối khi bạn chọn khớp thời lượng.")
+        sep.setObjectName("mutedText")
+        sep.setWordWrap(True)
+        options_layout.addWidget(sep)
 
         chk_vbox = QVBoxLayout()
         chk_vbox.setSpacing(6)
 
         self.chk_no_consecutive = QCheckBox(
-            "Không lặp bài liền kề (bài đầu lượt mới khác bài cuối lượt trước) [Khuyên dùng]", self
+            "Tránh phát cùng một bài liên tiếp", self
         )
         self.chk_no_consecutive.setChecked(bool(settings.get("no_consecutive_audio", True)))
         self.chk_no_consecutive.stateChanged.connect(lambda s: settings.set("no_consecutive_audio", self.chk_no_consecutive.isChecked()))
         chk_vbox.addWidget(self.chk_no_consecutive)
 
         self.chk_cycle = QCheckBox(
-            "Chỉ dùng mỗi bài 1 lần trong 1 lượt (Chu kỳ Shuffled Deck) [Khuyên dùng]", self
+            "Mỗi bài được dùng một lần trong mỗi lượt xáo trộn", self
         )
         self.chk_cycle.setChecked(True)
+        self.chk_cycle.setEnabled(False)
+        self.chk_cycle.setToolTip("Quy tắc cố định: dùng hết lượt trước khi bắt đầu lượt mới.")
         chk_vbox.addWidget(self.chk_cycle)
 
         self.chk_auto_reshuffle = QCheckBox(
-            "Tự động xáo trộn lượt mới khi dùng hết danh sách [Khuyên dùng]", self
+            "Xáo trộn lượt mới nếu nhạc chưa đủ thời lượng", self
         )
-        self.chk_auto_reshuffle.setChecked(True)
+        self.chk_auto_reshuffle.setChecked(bool(settings.get("auto_reshuffle_audio", True)))
+        self.chk_auto_reshuffle.toggled.connect(lambda value: settings.set("auto_reshuffle_audio", value))
         chk_vbox.addWidget(self.chk_auto_reshuffle)
 
-        layout.addLayout(chk_vbox)
+        options_layout.addLayout(chk_vbox)
 
         # Duration Mode (Mode A vs Mode B)
         mode_box = QHBoxLayout()
         mode_lbl = QLabel("Chế độ thời lượng:")
         mode_lbl.setStyleSheet("font-weight: 500;")
         self.combo_mode = ComboBox(self)
-        self.combo_mode.addItem("Chế độ A — Cắt bài cuối để khớp chính xác thời lượng", userData="fit_target")
-        self.combo_mode.addItem("Chế độ B — Giữ nguyên toàn bộ bài (không cắt xén)", userData="keep_all")
+        self.combo_mode.addItem("Khớp thời lượng — chỉ cắt phần đuôi bài cuối", userData="fit_target")
+        self.combo_mode.addItem("Phát trọn bài cuối — kết quả có thể dài hơn mục tiêu", userData="keep_all")
         saved_mode = settings.get("audio_mode", "fit_target")
         idx_mode = self.combo_mode.findData(saved_mode)
         if idx_mode >= 0:
@@ -161,7 +156,7 @@ class AudioPanel(CardWidget):
         self.combo_mode.currentIndexChanged.connect(lambda: settings.set("audio_mode", self.combo_mode.currentData() or "fit_target"))
         mode_box.addWidget(mode_lbl)
         mode_box.addWidget(self.combo_mode, 1)
-        layout.addLayout(mode_box)
+        options_layout.addLayout(mode_box)
 
         # Export Mode
         export_box = QHBoxLayout()
@@ -178,7 +173,9 @@ class AudioPanel(CardWidget):
         self.combo_export_target.currentIndexChanged.connect(self._on_export_target_changed)
         export_box.addWidget(export_lbl)
         export_box.addWidget(self.combo_export_target, 1)
-        layout.addLayout(export_box)
+        self.export_selector = QWidget(self)
+        self.export_selector.setLayout(export_box)
+        options_layout.addWidget(self.export_selector)
 
         # Audio Format for Audio-only export
         self.format_box = QHBoxLayout()
@@ -198,15 +195,13 @@ class AudioPanel(CardWidget):
         self.format_container = QWidget()
         self.format_container.setLayout(self.format_box)
         self.format_container.setVisible(self.get_export_target() == "audio_only")
-        layout.addWidget(self.format_container)
+        options_layout.addWidget(self.format_container)
 
-        # Auto-scan on startup if saved directory exists
-        if saved_folder and os.path.isdir(saved_folder):
-            QTimer.singleShot(500, self._start_scan)
+        layout.addWidget(self.options_widget)
 
     def _create_stat_card(self, num_text: str, label_text: str) -> QFrame:
         card = QFrame(self)
-        card.setStyleSheet("background-color: #F8F9FA; border: 1px solid #E5E5E5; border-radius: 6px; padding: 6px;")
+        card.setProperty("statCard", True)
         l = QVBoxLayout(card)
         l.setContentsMargins(8, 6, 8, 6)
         l.setSpacing(2)
@@ -236,30 +231,9 @@ class AudioPanel(CardWidget):
         chosen = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa file âm thanh", start_dir)
         if chosen:
             self.folder_edit.setText(chosen)
-            self._start_scan()
 
     def _start_scan(self):
-        folder = self.folder_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
-            InfoBar.error(
-                title="Lỗi thư mục",
-                content="Vui lòng chọn thư mục chứa file âm thanh hợp lệ!",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
-            return
-
-        self.btn_scan.setEnabled(False)
-        self.btn_browse.setEnabled(False)
-        self.scan_bar.setValue(0)
-        self.scan_bar.setVisible(True)
-        self.scan_status_lbl.setText("Đang tìm kiếm file âm thanh...")
-        self.scan_status_lbl.setVisible(True)
-
-        self.scanner_thread = AudioScannerThread(folder, self.chk_recursive.isChecked(), self)
-        self.scanner_thread.progress.connect(self._on_scan_progress)
-        self.scanner_thread.finished_scan.connect(self._on_scan_finished)
-        self.scanner_thread.start()
+        self.auto_scan.start()
 
     def _on_scan_progress(self, current: int, total: int, filename: str):
         if total > 0:
@@ -284,20 +258,8 @@ class AudioPanel(CardWidget):
         dur_str = f"{h}h {m:02d}m {s:02d}s" if h > 0 else f"{m:02d}m {s:02d}s"
         self.stat_duration_card.val_lbl.setText(dur_str)
 
-        if valid:
-            InfoBar.success(
-                title="Quét âm thanh hoàn tất",
-                content=f"Tìm thấy {len(valid)} bài hợp lệ (Tổng: {dur_str}).",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
-        else:
-            InfoBar.warning(
-                title="Không có file âm thanh",
-                content="Không tìm thấy file âm thanh hợp lệ trong thư mục đã chọn.",
-                parent=self,
-                position=InfoBarPosition.TOP
-            )
+        self.scan_status_lbl.setVisible(True)
+        self.scan_status_lbl.setText(f"Đã kiểm tra {len(valid)} tệp hợp lệ · {len(invalid)} tệp bỏ qua.")
 
         self.audios_scanned.emit(valid)
         self.config_changed.emit()

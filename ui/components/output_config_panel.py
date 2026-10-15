@@ -8,7 +8,7 @@ import subprocess
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGridLayout,
-    QFileDialog
+    QFileDialog, QToolButton, QCheckBox
 )
 from qfluentwidgets import (
     CardWidget, ComboBox, LineEdit, PushButton,
@@ -25,6 +25,20 @@ class OutputConfigPanel(CardWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
+        for combo in (self.combo_res, self.combo_fps, self.combo_aspect, self.combo_hw, self.combo_quality, self.combo_audio, self.combo_speed, self.combo_parallel, self.combo_decoder):
+            combo.currentIndexChanged.connect(lambda *args: self.config_changed.emit())
+        self.edit_outdir.textChanged.connect(lambda *args: self.config_changed.emit())
+        self.edit_prefix.textChanged.connect(lambda *args: self.config_changed.emit())
+        self.edit_bgm.textChanged.connect(lambda *args: self.config_changed.emit())
+        self.chk_gpu_processing.toggled.connect(lambda *args: self.config_changed.emit())
+        for combo, key in ((self.combo_quality, 'quality'), (self.combo_aspect, 'aspect_ratio_mode'),
+                           (self.combo_audio, 'video_audio_mode')):
+            index = combo.findData(settings.get(key, combo.currentData()))
+            if index >= 0:
+                combo.setCurrentIndex(index)
+            combo.currentIndexChanged.connect(lambda *args, c=combo, k=key: settings.set(k,c.currentData()))
+        self.edit_bgm.setText(settings.get('bgm_path', ''))
+        self.edit_bgm.textChanged.connect(lambda text: settings.set('bgm_path', text.strip()))
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -32,11 +46,13 @@ class OutputConfigPanel(CardWidget):
         layout.setContentsMargins(16, 16, 16, 16)
 
         # Title
-        title = QLabel("KHU VỰC C: CẤU HÌNH XUẤT VIDEO & ÂM THANH")
+        title = QLabel("Chất lượng và nơi lưu kết quả")
         title.setObjectName("sectionHeader")
         layout.addWidget(title)
 
         grid = QGridLayout()
+        advanced_grid = QGridLayout()
+        advanced_grid.setSpacing(10)
         grid.setSpacing(10)
 
         # 1. Resolution
@@ -68,8 +84,8 @@ class OutputConfigPanel(CardWidget):
         if idx_fps >= 0:
             self.combo_fps.setCurrentIndex(idx_fps)
         self.combo_fps.currentIndexChanged.connect(lambda: settings.set("fps", self.combo_fps.currentData()))
-        grid.addWidget(lbl_fps, 1, 0)
-        grid.addWidget(self.combo_fps, 1, 1)
+        advanced_grid.addWidget(lbl_fps, 0, 0)
+        advanced_grid.addWidget(self.combo_fps, 0, 1)
 
         # 3. Aspect Ratio Handling
         lbl_ar = QLabel("Xử lý tỷ lệ khung hình:")
@@ -77,12 +93,11 @@ class OutputConfigPanel(CardWidget):
         self.combo_aspect = ComboBox(self)
         self.combo_aspect.addItem("Giữ đủ hình + Viền đen (Fit / Letterbox) [Mặc định]", userData="fit")
         self.combo_aspect.addItem("Phóng to lấp đầy khung (Crop / Fill)", userData="crop")
-        grid.addWidget(lbl_ar, 2, 0)
-        grid.addWidget(self.combo_aspect, 2, 1)
+        advanced_grid.addWidget(lbl_ar, 1, 0)
+        advanced_grid.addWidget(self.combo_aspect, 1, 1)
 
         # 4. Hardware Acceleration
-        from core.hardware_detector import detect_hardware
-        self._hw_profile = detect_hardware()
+        # Hardware probing happens in the export worker, not while opening UI.
 
         lbl_hw = QLabel("Mã hóa phần cứng:")
         lbl_hw.setStyleSheet("font-weight: 500;")
@@ -98,46 +113,85 @@ class OutputConfigPanel(CardWidget):
         if idx_hw >= 0:
             self.combo_hw.setCurrentIndex(idx_hw)
         self.combo_hw.currentIndexChanged.connect(lambda: settings.set("hw_accel", self.combo_hw.currentData()))
-        grid.addWidget(lbl_hw, 3, 0)
-        grid.addWidget(self.combo_hw, 3, 1)
+        advanced_grid.addWidget(lbl_hw, 2, 0)
+        advanced_grid.addWidget(self.combo_hw, 2, 1)
 
         # Detected GPU Info Badge
         self.lbl_gpu_detected = QLabel(self)
-        if self._hw_profile.has_dedicated_gpu:
-            icon_status = "🟢"
-            self.lbl_gpu_detected.setStyleSheet("color: #107C41; font-weight: 600; font-size: 11px;")
-        else:
-            icon_status = "🔵"
-            self.lbl_gpu_detected.setStyleSheet("color: #0078D4; font-weight: 600; font-size: 11px;")
-        self.lbl_gpu_detected.setText(
-            f"{icon_status} Phát hiện: {self._hw_profile.primary_gpu_name} | {self._hw_profile.encoder_name_display}"
-        )
-        grid.addWidget(self.lbl_gpu_detected, 4, 1)
+        self.lbl_gpu_detected.setObjectName('mutedText')
+        self.lbl_gpu_detected.setWordWrap(True)
+        self.lbl_gpu_detected.setText('Chế độ Tự động sẽ kiểm tra bộ mã hóa trong nền khi bắt đầu xuất.')
+        advanced_grid.addWidget(self.lbl_gpu_detected, 3, 1)
 
         # 5. Quality Preset
         lbl_qual = QLabel("Chất lượng xuất:")
         lbl_qual.setStyleSheet("font-weight: 500;")
         self.combo_quality = ComboBox(self)
-        self.combo_quality.addItem("Cao (CRF 19 - Sắc nét, Khuyên dùng)", userData="high")
-        self.combo_quality.addItem("Tiêu chuẩn (CRF 23 - Nhẹ dung lượng)", userData="standard")
-        self.combo_quality.addItem("Rất cao (CRF 16 - Chất lượng gốc)", userData="very_high")
-        grid.addWidget(lbl_qual, 5, 0)
-        grid.addWidget(self.combo_quality, 5, 1)
+        self.combo_quality.addItem("Cao — cân bằng chất lượng và dung lượng", userData="high")
+        self.combo_quality.addItem("Tiêu chuẩn — dung lượng nhỏ hơn", userData="standard")
+        self.combo_quality.addItem("Rất cao — tệp lớn hơn", userData="very_high")
+        grid.addWidget(lbl_qual, 1, 0)
+        grid.addWidget(self.combo_quality, 1, 1)
+
+        # Render speed is separate from the output's visual quality setting.
+        self.combo_speed = ComboBox(self)
+        for title,key in [('Nhanh — ưu tiên thời gian xuất','fast'),
+                          ('Cân bằng — khuyên dùng','balanced'),
+                          ('Chất lượng — nén kỹ hơn, xuất lâu hơn','quality')]:
+            self.combo_speed.addItem(title,userData=key)
+        idx=self.combo_speed.findData(settings.get('render_speed','balanced'))
+        self.combo_speed.setCurrentIndex(idx if idx>=0 else 1)
+        self.combo_speed.currentIndexChanged.connect(lambda: settings.set('render_speed',self.combo_speed.currentData()))
+        grid.addWidget(QLabel('Tốc độ xử lý:'),2,0)
+        grid.addWidget(self.combo_speed,2,1)
+        self.combo_parallel = ComboBox(self)
+        for title,value in [('Tự động theo bộ xử lý',0),('1 đoạn — ít tài nguyên hơn',1),('2 đoạn — xử lý song song',2)]:
+            self.combo_parallel.addItem(title,userData=value)
+        idx=self.combo_parallel.findData(int(settings.get('parallel_segments',0)))
+        self.combo_parallel.setCurrentIndex(max(0,idx))
+        self.combo_parallel.currentIndexChanged.connect(lambda: settings.set('parallel_segments',self.combo_parallel.currentData()))
+        advanced_grid.addWidget(QLabel('Số đoạn xử lý cùng lúc:'),4,0)
+        advanced_grid.addWidget(self.combo_parallel,4,1)
+        self.chk_gpu_processing = QCheckBox('Tận dụng GPU khi xử lý video',self)
+        self.chk_gpu_processing.setChecked(bool(settings.get('gpu_processing',True)))
+        self.chk_gpu_processing.setToolTip('Áp dụng khi nguồn và GPU tương thích. Tự thử lại bằng cách thông thường nếu cần.')
+        self.chk_gpu_processing.toggled.connect(lambda value: settings.set('gpu_processing',value))
+        advanced_grid.addWidget(self.chk_gpu_processing,5,0,1,2)
+        self.combo_decoder = ComboBox(self)
+        for title,value in [('Tự động theo định dạng nguồn','auto'),('Ưu tiên GPU','gpu'),('CPU','cpu')]:
+            self.combo_decoder.addItem(title,userData=value)
+        idx=self.combo_decoder.findData(settings.get('decoder_mode','auto'))
+        self.combo_decoder.setCurrentIndex(max(0,idx))
+        self.combo_decoder.currentIndexChanged.connect(lambda: settings.set('decoder_mode',self.combo_decoder.currentData()))
+        advanced_grid.addWidget(QLabel('Đọc video nguồn:'),6,0)
+        advanced_grid.addWidget(self.combo_decoder,6,1)
 
         # 6. Audio Mode
         lbl_audio = QLabel("Cơ chế âm thanh:")
         lbl_audio.setStyleSheet("font-weight: 500;")
         self.combo_audio = ComboBox(self)
-        self.combo_audio.addItem("Tắt toàn bộ âm thanh gốc (-an) [Mặc định YouTube]", userData="none")
+        self.combo_audio.addItem("Tắt tiếng video nguồn", userData="none")
         self.combo_audio.addItem("Giữ âm thanh gốc từ video", userData="keep")
         self.combo_audio.addItem("Chèn file nhạc nền BGM (MP3/WAV)", userData="bgm")
         self.combo_audio.currentIndexChanged.connect(self._on_audio_mode_changed)
-        grid.addWidget(lbl_audio, 6, 0)
-        grid.addWidget(self.combo_audio, 6, 1)
+        grid.addWidget(lbl_audio, 3, 0)
+        grid.addWidget(self.combo_audio, 3, 1)
 
-        layout.addLayout(grid)
+        self.video_options = QWidget(self)
+        self.video_options.setLayout(grid)
+        layout.addWidget(self.video_options)
+        self.btn_advanced_video = QToolButton(self)
+        self.btn_advanced_video.setText("Tỷ lệ khung hình, FPS và tăng tốc")
+        self.btn_advanced_video.setCheckable(True)
+        layout.addWidget(self.btn_advanced_video)
+        self.advanced_video = QWidget(self)
+        self.advanced_video.setLayout(advanced_grid)
+        layout.addWidget(self.advanced_video)
+        self.advanced_video.setVisible(False)
+        self.btn_advanced_video.toggled.connect(self.advanced_video.setVisible)
 
         self.lbl_audio_status = QLabel(self)
+        self.lbl_audio_status.setWordWrap(True)
         self.lbl_audio_status.setStyleSheet("color: #0078D4; font-size: 11px; font-weight: 500; margin-top: 2px;")
         layout.addWidget(self.lbl_audio_status)
 
@@ -157,7 +211,7 @@ class OutputConfigPanel(CardWidget):
         layout.addWidget(self.bgm_widget)
 
         # Output folder row
-        out_lbl = QLabel("Thư mục lưu video đầu ra:")
+        out_lbl = QLabel("Thư mục lưu kết quả:")
         out_lbl.setStyleSheet("font-weight: 500;")
         layout.addWidget(out_lbl)
 
@@ -201,7 +255,7 @@ class OutputConfigPanel(CardWidget):
 
     def update_audio_mode_display(self, export_target: str):
         if export_target == "video_with_random_audio":
-            self.lbl_audio_status.setText("🎵 Đang ghép Kho nhạc ngẫu nhiên Phần 2 (Âm thanh gốc của video tự động bị loại bỏ).")
+            self.lbl_audio_status.setText("Dùng nhạc từ thư mục âm thanh; âm thanh gốc trong video sẽ được bỏ qua.")
             self.lbl_audio_status.setStyleSheet("color: #0078D4; font-size: 11px; font-weight: 500; margin-top: 2px;")
             self.combo_audio.setEnabled(False)
             self.bgm_widget.setVisible(False)
@@ -249,8 +303,20 @@ class OutputConfigPanel(CardWidget):
             aspect_ratio_mode=self.combo_aspect.currentData(),
             hw_accel=self.combo_hw.currentData(),
             quality=self.combo_quality.currentData(),
+            render_speed=self.combo_speed.currentData(),
+            parallel_segments=self.combo_parallel.currentData(),
+            gpu_processing=self.chk_gpu_processing.isChecked(),
+            decoder_mode=self.combo_decoder.currentData(),
             audio_mode=self.combo_audio.currentData(),
             bgm_path=self.edit_bgm.text().strip(),
             output_dir=self.edit_outdir.text().strip(),
             output_prefix="" if self.edit_prefix.text().strip() == "Random_Output" else self.edit_prefix.text().strip()
         )
+
+    def set_audio_only(self, audio_only: bool):
+        self.video_options.setVisible(not audio_only)
+        self.btn_advanced_video.setVisible(not audio_only)
+        self.advanced_video.setVisible(not audio_only and self.btn_advanced_video.isChecked())
+        self.lbl_audio_status.setVisible(not audio_only)
+        if audio_only:
+            self.bgm_widget.setVisible(False)
