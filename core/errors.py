@@ -36,3 +36,8 @@ class RenderError(RemixError):
 class HistoryConflictError(RemixError):
     """Raised when attempting to export segments that are excluded by export history."""
     pass
+
+
+class InsufficientDiskSpaceError(RemixError):
+    """Raised when destination drive does not have enough free space for the export batch."""
+    pass

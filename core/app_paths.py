@@ -57,3 +57,14 @@ def get_settings_json_path() -> str:
     if _TEST_DATA_DIR:
         return os.path.join(_TEST_DATA_DIR, "user_settings.json")
     return os.path.join(get_app_dir(), "user_settings.json")
+
+
+def get_cache_dir() -> str:
+    """Returns the path to the render cache directory."""
+    global _TEST_DATA_DIR
+    if _TEST_DATA_DIR:
+        cache_dir = os.path.join(_TEST_DATA_DIR, "cache")
+    else:
+        cache_dir = os.path.join(get_app_dir(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir

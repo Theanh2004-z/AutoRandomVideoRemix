@@ -598,6 +598,35 @@ class MainWindow(QMainWindow):
             self._pending_start_export = False
 
             # -------------------------------------------------------------
+            # PRE-FLIGHT: DISK SPACE ESTIMATION
+            # -------------------------------------------------------------
+            from core.disk_estimator import DiskEstimator
+            tot_dur = cut_cfg.target_total_duration * cut_cfg.batch_count
+            w, h = out_cfg.width_height
+            is_audio = (export_target == "audio_only")
+            req_bytes = DiskEstimator.estimate_required_bytes(
+                total_duration_sec=tot_dur,
+                width=w,
+                height=h,
+                is_audio_only=is_audio
+            )
+            disk_check = DiskEstimator.check_disk_space(out_cfg.output_dir, req_bytes)
+            if not disk_check.is_sufficient:
+                self.progress_panel.log("WARNING", disk_check.message)
+                reply = QMessageBox.warning(
+                    self,
+                    "Cảnh báo dung lượng ổ đĩa",
+                    f"{disk_check.message}\n\nBạn có chắc muốn tiếp tục xuất không?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    self.progress_panel.set_running_state(False)
+                    return
+            else:
+                self.progress_panel.log("INFO", f"💾 Kiểm tra ổ đĩa: Cần ~{disk_check.formatted_required}, trống {disk_check.formatted_available}.")
+
+            # -------------------------------------------------------------
             # CASE 1: STANDALONE AUDIO EXPORT
             # -------------------------------------------------------------
             if export_target == "audio_only":

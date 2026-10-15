@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from typing import List, Dict, Optional, Callable, Tuple
+from typing import List, Dict, Optional, Callable, Tuple, Any
 from core.config import SegmentInfo, OutputConfig, VideoInfo, AudioPlaylistItem
 from core.video_scanner import probe_video_file
 from core.history_manager import HistoryManager
@@ -30,12 +30,20 @@ class VideoProcessorEngine:
         output_config: OutputConfig,
         on_log: Optional[Callable[[str, str], None]] = None,
         on_segment_done: Optional[Callable[[int, int, SegmentInfo], None]] = None,
-        on_progress: Optional[Callable[[float, str], None]] = None
+        on_progress: Optional[Callable[[float, str], None]] = None,
+        render_cache: Optional[Any] = None
     ):
         self.config = output_config
         self.on_log = on_log or (lambda lvl, msg: None)
         self.on_segment_done = on_segment_done or (lambda idx, total, seg: None)
         self.on_progress = on_progress or (lambda pct, msg: None)
+        self.render_cache = render_cache
+        if self.render_cache is None:
+            try:
+                from core.render_cache import RenderCache
+                self.render_cache = RenderCache()
+            except Exception:
+                self.render_cache = None
 
         self._is_paused = False
         self._is_cancelled = False
@@ -217,6 +225,33 @@ class VideoProcessorEngine:
             clip.status = "Đang cắt"
             pct = round((i / total_segments) * 85.0, 1)
             self.on_progress(pct, f"Video #{video_index}/{total_videos}: Cắt đoạn {i+1}/{total_segments} ({clip.source_video_name})")
+
+            # Check render cache first
+            cache_key = None
+            if self.render_cache and self.render_cache.enabled:
+                try:
+                    cache_key = self.render_cache.compute_key(
+                        source_path=clip.source_video_path,
+                        start_sec=clip.start_sec,
+                        duration=clip.effective_duration,
+                        width=target_w,
+                        height=target_h,
+                        fps=target_fps,
+                        aspect_ratio_mode=self.config.aspect_ratio_mode,
+                        encoder=encoder_name,
+                        audio_mode=self.config.audio_mode
+                    )
+                    cached_file = self.render_cache.get(cache_key)
+                    if cached_file and os.path.isfile(cached_file):
+                        shutil.copy2(cached_file, seg_path)
+                        clip.status = "Hoàn tất"
+                        self.on_log("INFO", f"[{i+1}/{total_segments}] ⚡ Cache hit: {clip.source_video_name} ({clip.formatted_start}-{clip.formatted_end})")
+                        self.on_segment_done(i + 1, total_segments, clip)
+                        temp_segment_files.append(seg_path)
+                        continue
+                except Exception:
+                    pass
+
             self.on_log(
                 "INFO",
                 f"[{i+1}/{total_segments}] Cắt {clip.source_video_name} "
@@ -297,6 +332,11 @@ class VideoProcessorEngine:
                         return False
 
                 clip.status = "Hoàn tất"
+                if self.render_cache and self.render_cache.enabled and cache_key:
+                    try:
+                        self.render_cache.put(cache_key, seg_path)
+                    except Exception:
+                        pass
                 temp_segment_files.append(seg_path)
                 self.on_segment_done(i + 1, total_segments, clip)
 
@@ -510,6 +550,7 @@ class VideoProcessorWorker(QThread):
         output_config: OutputConfig,
         audio_playlists: Optional[List[List[AudioPlaylistItem]]] = None,
         record_history: bool = False,
+        render_cache: Optional[Any] = None,
         parent=None
     ):
         super().__init__(parent)
@@ -517,6 +558,7 @@ class VideoProcessorWorker(QThread):
         self.output_config = output_config
         self.audio_playlists = audio_playlists or []
         self.record_history = record_history
+        self.render_cache = render_cache
         self.engine: Optional[VideoProcessorEngine] = None
         self.audio_engine: Optional[AudioProcessorEngine] = None
 
@@ -600,7 +642,8 @@ class VideoProcessorWorker(QThread):
             output_config=self.output_config,
             on_log=lambda lvl, msg: self.log_emitted.emit(lvl, msg),
             on_segment_done=lambda idx, tot, seg: self.segment_progress.emit(idx, tot, seg),
-            on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg)
+            on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg),
+            render_cache=self.render_cache
         )
 
         for v_i, plan in enumerate(self.batch_plans):
