@@ -9,9 +9,7 @@ from typing import List, Optional
 from core.config import AudioInfo, AudioPlaylistItem, AudioConfig
 
 
-class InsufficientAudioError(Exception):
-    """Raised when audio pool is empty or cannot satisfy requirements."""
-    pass
+from core.errors import InsufficientAudioError
 
 
 class AudioPool:
