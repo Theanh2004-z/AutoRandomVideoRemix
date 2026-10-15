@@ -1,0 +1,42 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Distribution artifacts
+build/
+dist/
+*.manifest
+*.spec.bak
+
+# Large binary libraries and builds (distribute via GitHub Releases)
+bin/
+*.exe
+*.dll
+Mo_Tool_EXE.lnk
+
+# User personal configuration & export history
+user_settings.json
+history/*.json
+!history/.gitkeep
+
+# Media outputs and temporary render files
+*.mp4
+*.wav
+*.mp3
+*.m4a
+*.aac
+_temp_remix_*
+test_out.*
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
