@@ -77,12 +77,18 @@ class HistoryManager:
             for s in segments:
                 key = _make_segment_key(s.source_video_name, s.start_sec, s.end_sec)
                 if key not in existing_keys:
+                    actual_end = s.trim_end_sec if s.trim_end_sec is not None else s.end_sec
+                    if actual_end <= s.start_sec:
+                        actual_end = round(s.start_sec + s.effective_duration, 6)
+                    if actual_end <= s.start_sec:
+                        actual_end = s.start_sec + 0.001
+
                     rec = {
                         "segment_key": key,
                         "source_video_name": s.source_video_name,
                         "source_video_path": s.source_video_path,
                         "start_sec": s.start_sec,
-                        "end_sec": s.end_sec,
+                        "end_sec": actual_end,
                         "duration": s.duration,
                         "effective_duration": s.effective_duration,
                         "exported_at": now_str
@@ -96,13 +102,13 @@ class HistoryManager:
                     cursor.execute("""
                         INSERT OR IGNORE INTO assets (asset_id, file_path, filename, file_size, duration_sec)
                         VALUES (?, ?, ?, ?, ?);
-                    """, (aid, s.source_video_path, s.source_video_name, 0, s.end_sec))
+                    """, (aid, s.source_video_path, s.source_video_name, 0, max(s.end_sec, actual_end)))
                     cursor.execute("""
                         INSERT INTO history_intervals (
                             asset_id, source_filename, start_sec, end_sec,
                             start_frame, end_frame, job_id, output_video_index, exported_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """, (aid, s.source_video_name, s.start_sec, s.effective_duration, 0, 0, "legacy_export", 1, time.time()))
+                    """, (aid, s.source_video_name, s.start_sec, actual_end, 0, 0, "legacy_export", 1, time.time()))
 
             conn.commit()
 

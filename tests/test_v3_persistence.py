@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.errors import HistoryConflictError
 from core.app_paths import set_test_data_dir, reset_data_dir, get_history_db_path
-from core.history_repository import HistoryRepository
+from core.history_repository import HistoryRepository, CURRENT_SCHEMA_VERSION
 from core.history_migration import migrate_legacy_history_json
 from core.history_manager import HistoryManager
 from core.plan_manifest import PlanClip
@@ -35,7 +35,7 @@ class TestV3Persistence(unittest.TestCase):
             cursor = conn.cursor()
             cursor.execute("SELECT version FROM schema_version;")
             v = cursor.fetchone()[0]
-            self.assertEqual(v, 1)
+            self.assertEqual(v, CURRENT_SCHEMA_VERSION)
 
     def test_interval_overlap_detection(self):
         asset_id = "asset_vid_123"

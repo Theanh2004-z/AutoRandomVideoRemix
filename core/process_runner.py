@@ -67,25 +67,33 @@ class ProcessRunner:
     """Robust runner executing CLI tools with tree termination and memory safety."""
 
     @staticmethod
-    def kill_process_tree(pid: int):
+    def kill_process_tree(pid: int, proc: Optional[subprocess.Popen] = None):
         """Forcefully terminates a process and all its child processes on Windows."""
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
         if pid <= 0:
             return
+
         if os.name == 'nt':
             try:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=1.5
                 )
             except Exception:
                 pass
-        else:
-            try:
-                os.kill(pid, 9)
-            except Exception:
-                pass
+
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
 
     @classmethod
     def run(
@@ -125,7 +133,7 @@ class ProcessRunner:
         )
 
         def on_cancel():
-            cls.kill_process_tree(proc.pid)
+            cls.kill_process_tree(proc.pid, proc=proc)
 
         if cancellation_token:
             cancellation_token.register_callback(on_cancel)
@@ -154,8 +162,11 @@ class ProcessRunner:
             proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
             timed_out = True
-            cls.kill_process_tree(proc.pid)
-            proc.wait()
+            cls.kill_process_tree(proc.pid, proc=proc)
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
 
         reader_thread.join(timeout=1.0)
         try:

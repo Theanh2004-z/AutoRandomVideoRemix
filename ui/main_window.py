@@ -27,11 +27,22 @@ from qfluentwidgets import (
     InfoBarPosition, isDarkTheme
 )
 
+import uuid
 from core.config import VideoInfo, SegmentInfo, CutConfig, OutputConfig, AudioInfo, AudioConfig, AudioPlaylistItem
 from core.pool_manager import SegmentPool, BatchPlanner, InsufficientSegmentsError
 from core.audio_pool_manager import AudioPool, AudioPicker, InsufficientAudioError
 from core.audio_scanner import scan_audio_directory
 from core.video_processor import VideoProcessorWorker
+from core.export_planner import ExportPlanner
+from core.media_catalog import CatalogSegment
+from core.models import ConfigAdapterV2
+from core.history_repository import HistoryRepository
+from core.history_manager import HistoryManager, _make_segment_key
+from core.plan_manifest import PlanClip, PlanManifest
+from core.timebase import sec_to_frames
+from core.job_controller import JobController
+from core.output_commit import OutputCommit
+from core.output_validator import OutputValidator
 from ui.components.source_panel import SourcePanel
 from ui.components.audio_panel import AudioPanel
 from ui.components.cut_config_panel import CutConfigPanel
@@ -450,12 +461,70 @@ class MainWindow(QMainWindow):
             else:
                 return None
 
-        # Re-shuffle to reset is_used state before planning
+    def _convert_segments_to_catalog(self, segments: List[SegmentInfo], fps: float = 30.0) -> List[CatalogSegment]:
+        res = []
+        for s in segments:
+            start_f = sec_to_frames(s.start_sec, fps)
+            end_f = sec_to_frames(s.end_sec, fps)
+            frames = max(1, end_f - start_f)
+            aid = f"asset_{s.source_video_name}"
+            res.append(
+                CatalogSegment(
+                    segment_id=s.segment_id,
+                    asset_id=aid,
+                    source_path=s.source_video_path,
+                    source_filename=s.source_video_name,
+                    start_sec=s.start_sec,
+                    end_sec=s.end_sec,
+                    duration_sec=s.duration,
+                    start_frame=start_f,
+                    end_frame=end_f,
+                    frame_count=frames
+                )
+            )
+        return res
+
+    def _build_plans(self, cut_cfg: Optional[CutConfig] = None):
+        """Builds reproducible plans via V3 ExportPlanner."""
+        if cut_cfg is None:
+            cut_cfg = self.cut_panel.get_config()
+
+        if not self.pool or self.pool.total_segments == 0:
+            return None
+
+        # Reset used state in pool
         self.pool.reset_used()
 
-        planner = BatchPlanner(self.pool, cut_cfg)
+        v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg)
+
+        if cut_cfg.use_export_history:
+            history_keys = HistoryManager().load_history_keys()
+            available_pool = [s for s in self.pool.all_segments if _make_segment_key(s.source_video_name, s.start_sec, s.end_sec) not in history_keys]
+        else:
+            available_pool = list(self.pool.all_segments)
+
+        if not available_pool:
+            self.progress_panel.log("ERROR", "Tất cả các đoạn video trong kho đều đã xuất trước đó.")
+            return None
+
+        catalog_segs = self._convert_segments_to_catalog(available_pool, fps=v3_cut_cfg.fps)
+        audio_tracks = self.audio_pool.tracks if (hasattr(self, "audio_pool") and self.audio_pool) else []
+        audio_cfg = self.audio_panel.get_config()
+        out_cfg = self.output_panel.get_config()
+        out_cfg.export_target = self.audio_panel.get_export_target()
+
+        planner = ExportPlanner(
+            video_segments=catalog_segs,
+            audio_tracks=audio_tracks,
+            cut_config=v3_cut_cfg,
+            audio_config=audio_cfg,
+            output_config=out_cfg
+        )
+
         try:
-            plans = planner.plan_all(cut_cfg.target_total_duration)
+            manifest = planner.create_manifest()
+            self.current_manifest = manifest
+            plans = manifest.video_batches
             self.current_batch_plans = plans
             self._plan_is_stale = False
             self.table_view.set_plans(plans)
@@ -472,13 +541,21 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.Yes:
                 self.cut_panel.chk_allow_reuse.setChecked(True)
-                if batch > 1:
+                if cut_cfg.batch_count > 1:
                     self.cut_panel.chk_no_repeat_batch.setChecked(False)
                 cut_cfg = self.cut_panel.get_config()
-                # Retry with allow_reuse = True
-                planner = BatchPlanner(self.pool, cut_cfg)
+                v3_cut_cfg = ConfigAdapterV2.from_v2_cut_config(cut_cfg)
+                planner = ExportPlanner(
+                    video_segments=catalog_segs,
+                    audio_tracks=audio_tracks,
+                    cut_config=v3_cut_cfg,
+                    audio_config=audio_cfg,
+                    output_config=out_cfg
+                )
                 try:
-                    plans = planner.plan_all(cut_cfg.target_total_duration)
+                    manifest = planner.create_manifest()
+                    self.current_manifest = manifest
+                    plans = manifest.video_batches
                     self.current_batch_plans = plans
                     self._plan_is_stale = False
                     self.table_view.set_plans(plans)
@@ -667,30 +744,55 @@ class MainWindow(QMainWindow):
 
             # Auto-plan if plans not generated yet or stale
             plans = self.current_batch_plans
-            if not plans or self._plan_is_stale:
-                self.progress_panel.log("INFO", "📋 Đang tự động lập kế hoạch bốc đoạn ngẫu nhiên mới nhất...")
+            if not plans or self._plan_is_stale or not hasattr(self, "current_manifest"):
+                self.progress_panel.log("INFO", "📋 Đang tự động lập kế hoạch bốc đoạn ngẫu nhiên mới nhất bằng ExportPlanner (V3)...")
                 plans = self._build_plans(cut_cfg)
                 if not plans:
                     self.progress_panel.log("ERROR", "Lập kế hoạch ghép video thất bại.")
                     return
                 self._plan_is_stale = False
 
+            manifest = getattr(self, "current_manifest", None)
+
+            # V3 Pre-export reservation lock (R01, R04)
+            if cut_cfg.use_export_history:
+                history_repo = HistoryRepository()
+                job_id = f"job_{uuid.uuid4().hex[:8]}"
+                all_clips = [c for p in plans for c in p]
+                if not history_repo.reserve_batch(job_id, all_clips):
+                    self.progress_panel.log("ERROR", "Không thể giữ chỗ: Các đoạn trong kế hoạch trùng lặp với lịch sử xuất.")
+                    return
+
             audio_playlists_to_send = []
             if export_target == "video_with_random_audio":
                 out_cfg.audio_mode = "random_audio_pool"
-                picker = AudioPicker(self.audio_pool, audio_cfg)
-                audio_playlists_to_send = []
-                for p in plans:
-                    target_dur = sum(s.effective_duration for s in p)
-                    pl = picker.pick_playlist(target_duration=target_dur)
-                    audio_playlists_to_send.append(pl)
+                if manifest and manifest.audio_playlists:
+                    audio_playlists_to_send = [
+                        [
+                            AudioPlaylistItem(
+                                item_id=it.get("item_id", uuid.uuid4().hex[:12]),
+                                source_audio_path=it.get("source_audio_path", ""),
+                                source_audio_name=it.get("source_audio_name", ""),
+                                duration=float(it.get("duration", 0.0)),
+                                effective_duration=float(it.get("effective_duration", 0.0)),
+                                trim_end_sec=it.get("trim_end_sec"),
+                                cycle_index=int(it.get("cycle_index", 1)),
+                                playlist_position=int(it.get("playlist_position", 1))
+                            )
+                            for it in pl
+                        ]
+                        for pl in manifest.audio_playlists
+                    ]
+                else:
+                    audio_playlists_to_send = self._generate_audio_playlists(batch_count=len(plans)) or []
+
                 self.current_audio_playlists = audio_playlists_to_send
                 if audio_playlists_to_send:
                     self.table_view.set_audio_playlist(audio_playlists_to_send[0])
-                self.progress_panel.log(
-                    "INFO",
-                    f"✓ Đã chuẩn bị {len(audio_playlists_to_send[0])} bài nhạc ngẫu nhiên cho video."
-                )
+                    self.progress_panel.log(
+                        "INFO",
+                        f"✓ Đã chuẩn bị {len(audio_playlists_to_send[0])} bài nhạc ngẫu nhiên cho video bằng ExportPlanner (V3)."
+                    )
             else:
                 out_cfg.audio_mode = self.output_panel.get_config().audio_mode
 

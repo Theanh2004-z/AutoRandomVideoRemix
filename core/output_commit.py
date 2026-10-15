@@ -9,13 +9,40 @@ Phase 2: Perform OutputValidator inspection; on success, atomically promote/repl
 import os
 import shutil
 import uuid
-from typing import Optional, Tuple
+import threading
+from typing import Optional, Tuple, Set
 
 from core.output_validator import ValidationResult
 
 
 class OutputCommit:
-    """Manages staging and atomic promotion of rendered files."""
+    """Manages staging, path reservation, and atomic promotion of rendered files."""
+
+    _reserved_paths: Set[str] = set()
+    _reserve_lock = threading.Lock()
+
+    @classmethod
+    def reserve_path(cls, path: str) -> bool:
+        """Atomically reserves an output path in memory if not already taken or existing on disk."""
+        abs_p = os.path.abspath(path)
+        with cls._reserve_lock:
+            if abs_p in cls._reserved_paths or os.path.exists(abs_p):
+                return False
+            cls._reserved_paths.add(abs_p)
+            return True
+
+    @classmethod
+    def release_path(cls, path: str):
+        """Releases a previously reserved path."""
+        abs_p = os.path.abspath(path)
+        with cls._reserve_lock:
+            cls._reserved_paths.discard(abs_p)
+
+    @classmethod
+    def clear_reservations(cls):
+        """Clears all reserved paths."""
+        with cls._reserve_lock:
+            cls._reserved_paths.clear()
 
     @staticmethod
     def get_staging_path(final_path: str, temp_dir: Optional[str] = None) -> str:
@@ -33,33 +60,75 @@ class OutputCommit:
         cls,
         staging_path: str,
         final_destination_path: str,
-        validation: ValidationResult
+        validation: ValidationResult,
+        allow_overwrite: bool = False
     ) -> Tuple[bool, str]:
         """
         Atomically publishes the staging file to final_destination_path if validation succeeded.
+        Guarantees that an existing user output file is NOT overwritten unless allow_overwrite=True (R05).
         Returns: (success, message)
         """
         if not validation.is_valid:
-            # Discard staging file
             cls.discard_staging(staging_path)
+            cls.release_path(final_destination_path)
             return False, f"Xác minh file thất bại: {validation.error_msg}"
 
         if not os.path.isfile(staging_path):
+            cls.release_path(final_destination_path)
             return False, f"File staging không tồn tại: {staging_path}"
 
+        dest_abs = os.path.abspath(final_destination_path)
+
+        # Check existing destination
+        if os.path.exists(dest_abs) and not allow_overwrite:
+            cls.discard_staging(staging_path)
+            cls.release_path(final_destination_path)
+            return False, f"OUTPUT_CONFLICT: File đích đã tồn tại: {dest_abs}"
+
         try:
-            dest_dir = os.path.dirname(os.path.abspath(final_destination_path))
+            dest_dir = os.path.dirname(dest_abs)
             os.makedirs(dest_dir, exist_ok=True)
 
-            # Atomic replace on same filesystem; fallback to shutil.move across drives
-            try:
-                os.replace(staging_path, final_destination_path)
-            except OSError:
-                shutil.move(staging_path, final_destination_path)
+            if allow_overwrite:
+                try:
+                    os.replace(staging_path, dest_abs)
+                except OSError:
+                    shutil.move(staging_path, dest_abs)
+            else:
+                # Non-overwriting publication
+                if os.name == 'nt':
+                    try:
+                        os.rename(staging_path, dest_abs)
+                    except FileExistsError:
+                        cls.discard_staging(staging_path)
+                        cls.release_path(final_destination_path)
+                        return False, f"OUTPUT_CONFLICT: File đích đã tồn tại: {dest_abs}"
+                    except OSError:
+                        if os.path.exists(dest_abs):
+                            cls.discard_staging(staging_path)
+                            cls.release_path(final_destination_path)
+                            return False, f"OUTPUT_CONFLICT: File đích đã tồn tại: {dest_abs}"
+                        shutil.move(staging_path, dest_abs)
+                else:
+                    if os.path.exists(dest_abs):
+                        cls.discard_staging(staging_path)
+                        cls.release_path(final_destination_path)
+                        return False, f"OUTPUT_CONFLICT: File đích đã tồn tại: {dest_abs}"
+                    try:
+                        os.link(staging_path, dest_abs)
+                        os.unlink(staging_path)
+                    except (OSError, AttributeError):
+                        if os.path.exists(dest_abs):
+                            cls.discard_staging(staging_path)
+                            cls.release_path(final_destination_path)
+                            return False, f"OUTPUT_CONFLICT: File đích đã tồn tại: {dest_abs}"
+                        shutil.move(staging_path, dest_abs)
 
-            return True, f"Công bố thành công: {os.path.basename(final_destination_path)}"
+            cls.release_path(final_destination_path)
+            return True, f"Công bố thành công: {os.path.basename(dest_abs)}"
         except Exception as e:
             cls.discard_staging(staging_path)
+            cls.release_path(final_destination_path)
             return False, f"Lỗi di chuyển file sang đích: {e}"
 
     @staticmethod

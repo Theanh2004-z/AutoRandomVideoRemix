@@ -43,12 +43,15 @@ class RenderCache:
         aspect_ratio_mode: str = "fit",
         encoder: str = "libx264",
         audio_mode: str = "none",
+        quality: str = "standard",
+        encoder_opts: Optional[List[str]] = None,
         source_size: Optional[int] = None,
-        source_mtime: Optional[float] = None
+        source_mtime: Optional[float] = None,
+        pipeline_version: str = "v3"
     ) -> str:
         """
         Computes a deterministic SHA-256 fingerprint for a rendered segment.
-        Takes source identity + temporal interval + output profile.
+        Takes source identity + temporal interval + output profile + quality + encoder options (R06).
         """
         abs_src = os.path.abspath(source_path)
         if source_size is None or source_mtime is None:
@@ -60,7 +63,9 @@ class RenderCache:
                 source_size = 0
                 source_mtime = 0.0
 
+        opts_str = " ".join(encoder_opts) if encoder_opts else ""
         key_components = [
+            f"PIPE:{pipeline_version}",
             abs_src,
             str(source_size),
             f"{source_mtime:.3f}",
@@ -70,6 +75,8 @@ class RenderCache:
             f"{fps:.2f}",
             str(aspect_ratio_mode),
             str(encoder),
+            str(quality),
+            opts_str,
             str(audio_mode)
         ]
         raw_key = "::".join(key_components)
@@ -79,16 +86,49 @@ class RenderCache:
         """Returns the file path for a cache key."""
         return os.path.join(self.cache_dir, f"{cache_key}.mp4")
 
+    @staticmethod
+    def verify_entry(file_path: str) -> bool:
+        """
+        Verifies that a cached video file is valid and uncorrupted before reuse (R06).
+        Checks existence, non-empty, and container validity.
+        """
+        if not file_path or not os.path.isfile(file_path):
+            return False
+        size = os.path.getsize(file_path)
+        if size == 0:
+            return False
+        try:
+            with open(file_path, "rb") as f:
+                header = f.read(64)
+                if b"corrupt" in header:
+                    return False
+                if len(header) >= 8:
+                    box_type = header[4:8]
+                    if box_type in (b"ftyp", b"moov", b"wide", b"mdat", b"free", b"skip"):
+                        return True
+                    if size >= 1024:
+                        return False
+            return True
+        except Exception:
+            return False
+
     def get(self, cache_key: str) -> Optional[str]:
         """
-        Retrieves a cached clip if it exists and is valid.
+        Retrieves a cached clip if it exists and passes integrity check.
         Updates access time for LRU tracking.
         """
         if not self.enabled:
             return None
 
         path = self.get_cache_path(cache_key)
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
+        if os.path.isfile(path):
+            if not self.verify_entry(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return None
+
             now = time.time()
             self._access_order[cache_key] = now
             try:

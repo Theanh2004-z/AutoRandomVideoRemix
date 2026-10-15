@@ -151,6 +151,15 @@ class AudioPlanner:
                 last_track_path = self._get_path(track)
                 pos += 1
 
+            # Check if deck was exhausted without meeting target and cycle is disabled (R09)
+            if accumulated_samples < target_samples:
+                if not getattr(self.config, "auto_reshuffle_cycle", True):
+                    dur_so_far = samples_to_sec(accumulated_samples, ref_sr)
+                    raise InsufficientAudioError(
+                        f"Không đủ bài hát trong kho để đạt thời lượng mục tiêu ({dur_so_far:.1f}s / {target_dur:.1f}s) "
+                        f"khi tắt tự động lặp lại danh sách (auto_reshuffle_cycle=False)."
+                    )
+
             cycle_idx += 1
 
         return playlist

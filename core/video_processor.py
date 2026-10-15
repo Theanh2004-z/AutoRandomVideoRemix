@@ -15,6 +15,8 @@ from core.video_scanner import probe_video_file
 from core.history_manager import HistoryManager
 from core.audio_processor import AudioProcessorEngine
 from core.filename_generator import get_next_output_path
+from core.output_validator import OutputValidator
+from core.output_commit import OutputCommit
 
 from PySide6.QtCore import QThread, Signal
 
@@ -239,10 +241,12 @@ class VideoProcessorEngine:
                         fps=target_fps,
                         aspect_ratio_mode=self.config.aspect_ratio_mode,
                         encoder=encoder_name,
-                        audio_mode=self.config.audio_mode
+                        audio_mode=self.config.audio_mode,
+                        quality=getattr(self.config, "quality", "standard"),
+                        encoder_opts=encoder_opts
                     )
                     cached_file = self.render_cache.get(cache_key)
-                    if cached_file and os.path.isfile(cached_file):
+                    if cached_file and self.render_cache.verify_entry(cached_file):
                         shutil.copy2(cached_file, seg_path)
                         clip.status = "Hoàn tất"
                         self.on_log("INFO", f"[{i+1}/{total_segments}] ⚡ Cache hit: {clip.source_video_name} ({clip.formatted_start}-{clip.formatted_end})")
@@ -297,6 +301,24 @@ class VideoProcessorEngine:
                     if encoder_name != "libx264":
                         self.on_log("WARNING", f"GPU Encoder ({encoder_name}) gặp sự cố tại đoạn {i+1}: {err_text[:120]}... Đang tự động chuyển sang CPU Fallback (libx264) để hoàn thành đoạn!")
                         encoder_name, encoder_opts = self._determine_encoder(force_cpu=True)
+                        # Recompute cache key with actual CPU encoder settings (R06)
+                        if self.render_cache and self.render_cache.enabled:
+                            try:
+                                cache_key = self.render_cache.compute_key(
+                                    source_path=clip.source_video_path,
+                                    start_sec=clip.start_sec,
+                                    duration=clip.effective_duration,
+                                    width=target_w,
+                                    height=target_h,
+                                    fps=target_fps,
+                                    aspect_ratio_mode=self.config.aspect_ratio_mode,
+                                    encoder=encoder_name,
+                                    audio_mode=self.config.audio_mode,
+                                    quality=getattr(self.config, "quality", "standard"),
+                                    encoder_opts=encoder_opts
+                                )
+                            except Exception:
+                                pass
                         fallback_cmd = [
                             "ffmpeg", "-y",
                             "-ss", str(clip.start_sec),
@@ -417,7 +439,6 @@ class VideoProcessorEngine:
                     "-map", "1:a:0",
                     "-c:v", "copy",
                     "-c:a", "aac", "-b:a", "192k",
-                    "-shortest",
                     final_temp_path
                 ]
                 try:
@@ -482,49 +503,50 @@ class VideoProcessorEngine:
         else:
             shutil.move(merged_intermediate, final_temp_path)
 
-        # Move to final output path
-        if os.path.isfile(output_file_path):
-            try:
-                os.remove(output_file_path)
-            except Exception:
-                pass
-        shutil.move(final_temp_path, output_file_path)
-
-        # Step 9: Probe Validation (Kiểm tra chất lượng đầu ra)
+        # Step 9: Probe Validation & Atomic 2-Phase Publication (V3)
         self.on_progress(98.0, f"Video #{video_index}/{total_videos}: Đang kiểm tra file xuất...")
-        self.on_log("INFO", "Kiểm tra tính toàn vẹn của video đầu ra...")
-        val_info = probe_video_file(output_file_path)
-
-        if not val_info.is_valid:
-            self.on_log("ERROR", f"Kiểm tra thất bại: {val_info.error_msg}")
-            if os.path.isfile(output_file_path):
-                try:
-                    os.remove(output_file_path)
-                except Exception:
-                    pass
-            self._cleanup_temp_dir()
-            return False
-
-        if self.config.audio_mode in ("random_audio_pool", "bgm") and not val_info.has_audio:
-            self.on_log("ERROR", "Kiểm tra thất bại: Video đầu ra không có luồng âm thanh như cấu hình!")
-            if os.path.isfile(output_file_path):
-                try:
-                    os.remove(output_file_path)
-                except Exception:
-                    pass
-            self._cleanup_temp_dir()
-            return False
+        self.on_log("INFO", "Kiểm tra tính toàn vẹn của video đầu ra bằng OutputValidator...")
 
         expected_dur = sum(c.effective_duration for c in plan)
-        dur_diff = abs(val_info.duration - expected_dur)
-        self.on_log(
-            "SUCCESS",
-            f"Kiểm tra thành công! File: {os.path.basename(output_file_path)} | "
-            f"Thời lượng thực tế: {val_info.formatted_duration} ({val_info.duration:.2f}s) | "
-            f"Độ phân giải: {val_info.width}x{val_info.height} | Sai lệch: {dur_diff:.2f}s"
+        target_fps = float(self.config.fps)
+        val_result = OutputValidator.validate_video(
+            file_path=final_temp_path,
+            expected_duration=expected_dur,
+            expected_width=target_w,
+            expected_height=target_h,
+            expected_fps=target_fps,
+            require_audio=(self.config.audio_mode in ("random_audio_pool", "bgm")),
+            duration_tolerance_sec=1.0
         )
 
-        # Step 10: Clean up temp
+        if not val_result.is_valid:
+            self.on_log("ERROR", f"Kiểm tra chất lượng thất bại: {val_result.error_msg}")
+            OutputCommit.discard_staging(final_temp_path)
+            self._cleanup_temp_dir()
+            return False
+
+        # Step 10: Atomic publication via OutputCommit (prevents overwrite)
+        ok, commit_msg = OutputCommit.publish_file(
+            staging_path=final_temp_path,
+            final_destination_path=output_file_path,
+            validation=val_result,
+            allow_overwrite=False
+        )
+        if not ok:
+            self.on_log("ERROR", commit_msg)
+            self._cleanup_temp_dir()
+            return False
+
+        dur_diff = abs((val_result.actual_duration or 0.0) - expected_dur)
+        self.on_log(
+            "SUCCESS",
+            f"Kiểm tra & công bố thành công! File: {os.path.basename(output_file_path)} | "
+            f"Thời lượng thực tế: {val_result.actual_duration:.2f}s | "
+            f"Độ phân giải: {val_result.actual_width}x{val_result.actual_height} | "
+            f"FPS: {val_result.actual_fps:.1f} | Sai lệch: {dur_diff:.2f}s"
+        )
+
+        # Step 11: Clean up temp
         self._cleanup_temp_dir()
         self.on_progress(100.0, f"Hoàn tất video #{video_index}/{total_videos}!")
         return True

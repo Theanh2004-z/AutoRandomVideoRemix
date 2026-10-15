@@ -41,7 +41,8 @@ class OutputValidator:
         expected_height: int,
         expected_fps: Optional[float] = None,
         duration_tolerance_sec: float = 1.0,
-        require_audio: bool = False
+        require_audio: bool = False,
+        deep_validate: bool = False
     ) -> ValidationResult:
         """
         Validates an exported video file against target technical specifications.
@@ -126,6 +127,13 @@ class OutputValidator:
                 error_msg=f"Sai độ phân giải: thực tế {w}x{h}, yêu cầu {expected_width}x{expected_height}."
             )
 
+        # Check FPS if expected_fps specified (R13)
+        if expected_fps is not None and abs(fps - expected_fps) > 0.1:
+            return ValidationResult(
+                is_valid=False,
+                error_msg=f"Sai tốc độ khung hình (FPS): thực tế {fps:.2f}fps, yêu cầu {expected_fps:.2f}fps."
+            )
+
         # 3. Check duration tolerance
         diff = abs(actual_dur - expected_duration)
         if diff > duration_tolerance_sec:
@@ -134,19 +142,28 @@ class OutputValidator:
                 error_msg=f"Thời lượng sai lệch quá mức: thực tế {actual_dur:.2f}s, yêu cầu {expected_duration:.2f}s (lệch {diff:.2f}s)."
             )
 
-        # 4. Decode smoke-test (decode first 1s into null sink)
-        decode_cmd = [
-            "ffmpeg", "-y", "-v", "error",
-            "-i", file_path,
-            "-t", "1.0",
-            "-f", "null", "-"
-        ]
-        d_res = ProcessRunner.run(decode_cmd, timeout_sec=5.0)
-        if d_res.returncode != 0:
-            return ValidationResult(
-                is_valid=False,
-                error_msg=f"Lỗi giải mã file (corrupt stream): {d_res.stderr[:200]}"
-            )
+        # 4. Decode validation (smoke-test + multi-point if deep_validate enabled) (R13)
+        check_points = [("0.0", "1.0")]
+        if deep_validate and actual_dur > 3.0:
+            mid_start = str(round(actual_dur / 2.0, 2))
+            tail_start = str(round(max(0.0, actual_dur - 1.5), 2))
+            check_points.append((mid_start, "1.0"))
+            check_points.append((tail_start, "1.5"))
+
+        for ss_point, t_dur in check_points:
+            decode_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-ss", ss_point,
+                "-i", file_path,
+                "-t", t_dur,
+                "-f", "null", "-"
+            ]
+            d_res = ProcessRunner.run(decode_cmd, timeout_sec=5.0)
+            if d_res.returncode != 0:
+                return ValidationResult(
+                    is_valid=False,
+                    error_msg=f"Lỗi giải mã file tại {ss_point}s (corrupt stream): {d_res.stderr[:200]}"
+                )
 
         return ValidationResult(
             is_valid=True,

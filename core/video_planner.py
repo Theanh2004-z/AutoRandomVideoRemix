@@ -32,23 +32,31 @@ class VideoPlanner:
         self.rng = random.Random(seed) if seed is not None else random.Random()
         self.seed = seed
 
-    def plan_batch(self) -> List[List[PlanClip]]:
+    def plan_batch(self, target_durations: Optional[List[float]] = None) -> List[List[PlanClip]]:
         """
         Plans all videos in the batch according to the configured policies.
+        If target_durations is provided, each video plans to its specific duration
+        while sharing a unified batch_used_ids set (R07).
         Returns: List of video plans, where each plan is a List[PlanClip].
         """
-        target_frames = sec_to_frames(self.config.target_total_duration, self.config.fps)
-        total_batches = self.config.batch_count
+        if target_durations is not None:
+            durations = list(target_durations)
+            total_batches = len(durations)
+        else:
+            total_batches = self.config.batch_count
+            durations = [self.config.target_total_duration] * total_batches
 
         # Global set of segment_ids used across the batch (for UNIQUE_BATCH)
         batch_used_ids: Set[str] = set()
         all_plans: List[List[PlanClip]] = []
 
-        for video_idx in range(1, total_batches + 1):
+        for video_idx, dur in enumerate(durations, start=1):
+            target_frames = sec_to_frames(dur, self.config.fps)
             plan = self._plan_single_video(
                 video_index=video_idx,
                 target_frames=target_frames,
-                batch_used_ids=batch_used_ids
+                batch_used_ids=batch_used_ids,
+                target_sec=dur
             )
             all_plans.append(plan)
 
@@ -58,9 +66,12 @@ class VideoPlanner:
         self,
         video_index: int,
         target_frames: int,
-        batch_used_ids: Set[str]
+        batch_used_ids: Set[str],
+        target_sec: Optional[float] = None
     ) -> List[PlanClip]:
         """Plans a single video output to reach target_frames."""
+        eff_target_sec = target_sec if target_sec is not None else self.config.target_total_duration
+
         # 1. Determine initial eligible pool for this video
         if self.config.unique_policy == UniquePolicy.UNIQUE_BATCH:
             available = [s for s in self.segments if s.segment_id not in batch_used_ids]
@@ -101,11 +112,10 @@ class VideoPlanner:
                 else:
                     # Insufficient footage
                     gathered_sec = frames_to_sec(accumulated_frames, self.config.fps)
-                    target_sec = self.config.target_total_duration
-                    needed_sec = round(target_sec - gathered_sec, 2)
+                    needed_sec = round(eff_target_sec - gathered_sec, 2)
                     raise InsufficientSegmentsError(
                         f"Không đủ đoạn để hoàn thành video #{video_index}!\n"
-                        f"• Đã ghép: {len(plan_clips)} đoạn ({gathered_sec:.1f}s / {target_sec:.1f}s)\n"
+                        f"• Đã ghép: {len(plan_clips)} đoạn ({gathered_sec:.1f}s / {eff_target_sec:.1f}s)\n"
                         f"• Cần thêm: {needed_sec:.1f}s\n"
                         f"• Giải pháp: Bật 'Bốc có hoàn lại' (cycle_output), thêm video nguồn, hoặc giảm thời lượng đầu ra."
                     )

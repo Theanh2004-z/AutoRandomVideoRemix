@@ -114,47 +114,13 @@ class ExportPlanner:
                     for pl in raw_pls
                 ]
 
-                # 2. Plan video matching exact combined audio duration for each batch
-                all_v_plans = []
-                for b_idx in range(total_batches):
-                    audio_dur = sum(item.effective_duration for item in raw_pls[b_idx])
-                    # Create matching config for this video's exact duration
-                    v_cfg = NormalizedCutConfig(
-                        segment_duration=self.cut_config.segment_duration,
-                        target_total_duration=audio_dur,
-                        batch_count=1,
-                        merge_remainder=self.cut_config.merge_remainder,
-                        unique_policy=self.cut_config.unique_policy,
-                        anti_consecutive_policy=self.cut_config.anti_consecutive_policy,
-                        trim_last_segment=self.cut_config.trim_last_segment,
-                        fps=self.cut_config.fps
-                    )
-                    v_seed = (self.seed + b_idx) if self.seed is not None else None
-                    vp = VideoPlanner(self.video_segments, v_cfg, seed=v_seed)
-                    plan = vp.plan_batch()[0]
-                    # Update video index
-                    updated_plan = [
-                        PlanClip(
-                            clip_id=f"clip_v{b_idx+1}_p{c.plan_position}_{c.segment_id}",
-                            segment_id=c.segment_id,
-                            asset_id=c.asset_id,
-                            source_path=c.source_path,
-                            source_filename=c.source_filename,
-                            start_frame=c.start_frame,
-                            end_frame=c.end_frame,
-                            frame_count=c.frame_count,
-                            start_sec=c.start_sec,
-                            end_sec=c.end_sec,
-                            effective_duration=c.effective_duration,
-                            target_video_index=b_idx + 1,
-                            plan_position=c.plan_position,
-                            is_trimmed=c.is_trimmed,
-                            trim_end_sec=c.trim_end_sec
-                        )
-                        for c in plan
-                    ]
-                    all_v_plans.append(updated_plan)
-                video_plans = all_v_plans
+                # 2. Plan video matching exact combined audio duration for each batch using unified planner (R07)
+                audio_durations = [
+                    sum(item.effective_duration for item in pl)
+                    for pl in raw_pls
+                ]
+                vp = VideoPlanner(self.video_segments, self.cut_config, seed=self.seed)
+                video_plans = vp.plan_batch(target_durations=audio_durations)
 
             else:
                 # fit_target: Hình quyết định timeline

@@ -11,7 +11,7 @@ from core.models import NormalizedCutConfig
 from core.media_catalog import CatalogSegment
 
 
-@dataclass(frozen=True)
+@dataclass
 class PlanClip:
     """Individual cut clip bound to an output video position."""
     clip_id: str
@@ -29,6 +29,47 @@ class PlanClip:
     plan_position: int
     is_trimmed: bool = False
     trim_end_sec: Optional[float] = None
+    status: str = "Chờ xử lý"
+
+    @property
+    def source_video_name(self) -> str:
+        return self.source_filename
+
+    @property
+    def source_video_path(self) -> str:
+        return self.source_path
+
+    @property
+    def duration(self) -> float:
+        return round(self.end_sec - self.start_sec, 6)
+
+    @property
+    def formatted_start(self) -> str:
+        m, s = divmod(int(self.start_sec), 60)
+        h, m = divmod(m, 60)
+        frac = int(round((self.start_sec - int(self.start_sec)) * 100))
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}.{frac:02d}"
+        return f"{m:02d}:{s:02d}.{frac:02d}"
+
+    @property
+    def formatted_end(self) -> str:
+        end = self.trim_end_sec if self.trim_end_sec is not None else self.end_sec
+        m, s = divmod(int(end), 60)
+        h, m = divmod(m, 60)
+        frac = int(round((end - int(end)) * 100))
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}.{frac:02d}"
+        return f"{m:02d}:{s:02d}.{frac:02d}"
+
+    @property
+    def formatted_effective(self) -> str:
+        m, s = divmod(int(self.effective_duration), 60)
+        h, m = divmod(m, 60)
+        frac = int(round((self.effective_duration - int(self.effective_duration)) * 100))
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}.{frac:02d}"
+        return f"{m:02d}:{s:02d}.{frac:02d}"
 
     @classmethod
     def from_catalog_segment(
@@ -41,10 +82,18 @@ class PlanClip:
         eff_dur = seg.duration_sec
         is_trimmed = False
         trim_end = None
+        start_frame = seg.start_frame
+        end_frame = seg.end_frame
+        frame_count = seg.frame_count
+
         if trim_duration is not None and trim_duration < seg.duration_sec:
             eff_dur = round(trim_duration, 6)
             is_trimmed = True
             trim_end = round(seg.start_sec + trim_duration, 6)
+            fps = seg.frame_count / seg.duration_sec if seg.duration_sec > 0 else 30.0
+            trim_frames = max(1, round(trim_duration * fps))
+            end_frame = start_frame + trim_frames
+            frame_count = trim_frames
 
         clip_id = f"clip_v{target_video_index}_p{plan_position}_{seg.segment_id}"
         return cls(
@@ -53,9 +102,9 @@ class PlanClip:
             asset_id=seg.asset_id,
             source_path=seg.source_path,
             source_filename=seg.source_filename,
-            start_frame=seg.start_frame,
-            end_frame=seg.end_frame,
-            frame_count=seg.frame_count,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_count=frame_count,
             start_sec=seg.start_sec,
             end_sec=seg.end_sec,
             effective_duration=eff_dur,
@@ -89,12 +138,26 @@ class PlanManifest:
         audio_pls = audio_playlists or []
         meta = metadata or {}
 
-        # Compute deterministic manifest ID from clips and seed
+        # Compute deterministic manifest ID from clips, playlists, metadata, schema version and seed (R11)
         clip_reprs = []
         for b in video_batches:
             for c in b:
-                clip_reprs.append(f"{c.clip_id}:{c.effective_duration:.3f}")
-        content = f"{seed}::{catalog_snapshot_hash}::" + "|".join(clip_reprs)
+                clip_reprs.append(f"{c.clip_id}:{c.effective_duration:.3f}:{c.start_frame}:{c.end_frame}")
+
+        audio_reprs = []
+        for pl in audio_pls:
+            for item in pl:
+                name = item.get("source_audio_name") or item.get("source_audio_path") or ""
+                dur = float(item.get("effective_duration", 0.0))
+                audio_reprs.append(f"{name}:{dur:.3f}")
+
+        meta_json = json.dumps(meta, sort_keys=True, ensure_ascii=False)
+        content = (
+            f"SCHEMA_V3::{seed}::{catalog_snapshot_hash}::"
+            f"V:[{'|'.join(clip_reprs)}]::"
+            f"A:[{'|'.join(audio_reprs)}]::"
+            f"M:[{meta_json}]"
+        )
         mid = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
         return cls(

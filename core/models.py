@@ -12,6 +12,43 @@ from core.policies import UniquePolicy, AntiConsecutivePolicy, AudioMatchMode
 from core.errors import ConfigValidationError
 
 
+def compute_media_content_hash(file_path: str, file_size: Optional[int] = None) -> str:
+    """
+    Computes a content-based SHA-256 fingerprint by hashing file size
+    and chunks from start, middle, and end of file.
+    Fast (O(1) I/O regardless of file size) and independent of file path or name (R12).
+    """
+    if not os.path.isfile(file_path):
+        return hashlib.sha256(f"missing::{file_path}".encode("utf-8")).hexdigest()[:16]
+
+    size = os.path.getsize(file_path) if file_size is None else file_size
+    h = hashlib.sha256()
+    h.update(str(size).encode("utf-8"))
+
+    chunk_size = 64 * 1024  # 64 KB
+    try:
+        with open(file_path, "rb") as f:
+            # Chunk 1: Head
+            head = f.read(chunk_size)
+            h.update(head)
+
+            # Chunk 2: Mid
+            if size > chunk_size * 2:
+                mid_offset = (size - chunk_size) // 2
+                f.seek(mid_offset)
+                h.update(f.read(chunk_size))
+
+            # Chunk 3: Tail
+            if size > chunk_size * 3:
+                tail_offset = max(0, size - chunk_size)
+                f.seek(tail_offset)
+                h.update(f.read(chunk_size))
+    except Exception:
+        h.update(str(size).encode("utf-8"))
+
+    return h.hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class AssetFingerprint:
     """Immutable identity fingerprint of a media file."""
@@ -22,10 +59,10 @@ class AssetFingerprint:
 
     @classmethod
     def from_file(cls, path: str, duration: float = 0.0) -> "AssetFingerprint":
-        """Generate fingerprint from file path, size, and duration."""
+        """Generate fingerprint from content bytes and file size."""
         abs_path = os.path.abspath(path)
         size = os.path.getsize(abs_path) if os.path.isfile(abs_path) else 0
-        h = hashlib.sha256(f"{abs_path}::{size}::{duration:.3f}".encode("utf-8")).hexdigest()[:16]
+        h = compute_media_content_hash(abs_path, size)
         return cls(asset_id=h, file_path=abs_path, file_size=size, duration_sec=duration)
 
 
