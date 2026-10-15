@@ -34,9 +34,8 @@ from core.segment_slicer import slice_all_videos
 # Exceptions
 # ------------------------------------------------------------------
 
-class InsufficientSegmentsError(Exception):
-    """Raised when the pool cannot supply enough footage for the target duration."""
-    pass
+from core.errors import InsufficientSegmentsError
+
 
 
 # ------------------------------------------------------------------
