@@ -18,6 +18,9 @@ Mo_Tool_EXE.lnk
 # User personal configuration & export history
 user_settings.json
 history/*.json
+history/*.db
+history/*.bak
+*.db
 !history/.gitkeep
 
 # Media outputs and temporary render files

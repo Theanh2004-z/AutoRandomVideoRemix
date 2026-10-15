@@ -1,15 +1,19 @@
 """
 History Manager — tracks and persists used video segments across export runs.
-Stores history in history/export_history.json so that content creators
-never duplicate already used segments in future videos.
+Integrates with SQLite-backed HistoryRepository (V3) while maintaining full
+backward compatibility with legacy JSON history records.
 """
 import os
 import json
 import time
-from typing import List, Set, Dict, Any
-from core.config import SegmentInfo
+from typing import List, Set, Dict, Any, Optional
 
-HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "history")
+from core.config import SegmentInfo
+from core.app_paths import get_data_dir, get_history_db_path
+from core.history_repository import HistoryRepository
+from core.history_migration import migrate_legacy_history_json
+
+HISTORY_DIR = get_data_dir()
 HISTORY_FILE = os.path.join(HISTORY_DIR, "export_history.json")
 
 
@@ -19,11 +23,20 @@ def _make_segment_key(source_video_name: str, start_sec: float, end_sec: float) 
 
 
 class HistoryManager:
-    """Manages reading and writing of export history."""
+    """Unified history manager bridging SQLite repository and legacy JSON access."""
 
-    def __init__(self, history_file: str = HISTORY_FILE):
+    def __init__(self, history_file: str = HISTORY_FILE, db_path: Optional[str] = None):
         self.history_file = history_file
-        os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+        self.db_path = db_path or (
+            os.path.join(os.path.dirname(os.path.abspath(history_file)), "export_history.db")
+            if history_file != HISTORY_FILE else get_history_db_path()
+        )
+        os.makedirs(os.path.dirname(os.path.abspath(self.history_file)), exist_ok=True)
+        self.repo = HistoryRepository(self.db_path)
+
+        # Run one-time migration if legacy JSON exists and SQLite is empty
+        if os.path.isfile(self.history_file) and self.repo.get_total_records() == 0:
+            migrate_legacy_history_json(self.history_file, self.repo)
 
     def load_history_records(self) -> List[Dict[str, Any]]:
         """Load all raw records from history file."""
@@ -50,7 +63,7 @@ class HistoryManager:
 
     def record_exported_segments(self, segments: List[SegmentInfo]) -> int:
         """
-        Append newly exported segments to history.
+        Append newly exported segments to history (both SQLite and JSON).
         Returns number of newly added records.
         """
         existing_records = self.load_history_records()
@@ -59,22 +72,39 @@ class HistoryManager:
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         added_count = 0
 
-        for s in segments:
-            key = _make_segment_key(s.source_video_name, s.start_sec, s.end_sec)
-            if key not in existing_keys:
-                rec = {
-                    "segment_key": key,
-                    "source_video_name": s.source_video_name,
-                    "source_video_path": s.source_video_path,
-                    "start_sec": s.start_sec,
-                    "end_sec": s.end_sec,
-                    "duration": s.duration,
-                    "effective_duration": s.effective_duration,
-                    "exported_at": now_str
-                }
-                existing_records.append(rec)
-                existing_keys.add(key)
-                added_count += 1
+        with self.repo._get_connection() as conn:
+            cursor = conn.cursor()
+            for s in segments:
+                key = _make_segment_key(s.source_video_name, s.start_sec, s.end_sec)
+                if key not in existing_keys:
+                    rec = {
+                        "segment_key": key,
+                        "source_video_name": s.source_video_name,
+                        "source_video_path": s.source_video_path,
+                        "start_sec": s.start_sec,
+                        "end_sec": s.end_sec,
+                        "duration": s.duration,
+                        "effective_duration": s.effective_duration,
+                        "exported_at": now_str
+                    }
+                    existing_records.append(rec)
+                    existing_keys.add(key)
+                    added_count += 1
+
+                    # Also persist in SQLite
+                    aid = f"asset_{s.source_video_name}"
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO assets (asset_id, file_path, filename, file_size, duration_sec)
+                        VALUES (?, ?, ?, ?, ?);
+                    """, (aid, s.source_video_path, s.source_video_name, 0, s.end_sec))
+                    cursor.execute("""
+                        INSERT INTO history_intervals (
+                            asset_id, source_filename, start_sec, end_sec,
+                            start_frame, end_frame, job_id, output_video_index, exported_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (aid, s.source_video_name, s.start_sec, s.effective_duration, 0, 0, "legacy_export", 1, time.time()))
+
+            conn.commit()
 
         try:
             with open(self.history_file, "w", encoding="utf-8") as f:
@@ -85,7 +115,8 @@ class HistoryManager:
         return added_count
 
     def clear_history(self) -> bool:
-        """Clear all history records."""
+        """Clear all history records in both SQLite and JSON."""
+        self.repo.clear_history()
         try:
             with open(self.history_file, "w", encoding="utf-8") as f:
                 json.dump([], f)
@@ -95,4 +126,6 @@ class HistoryManager:
 
     def get_history_count(self) -> int:
         """Return total number of saved historical segments."""
-        return len(self.load_history_keys())
+        repo_count = self.repo.get_total_records()
+        json_count = len(self.load_history_keys())
+        return max(repo_count, json_count)
