@@ -44,16 +44,32 @@ class SettingsManager:
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
             cls._instance = super().__new__(cls)
+            cls._instance._file_path = SETTINGS_FILE
             cls._instance._data = {}
             cls._instance.load()
         return cls._instance
 
+    @property
+    def file_path(self) -> str:
+        return getattr(self, "_file_path", SETTINGS_FILE)
+
+    def set_file_path(self, path: str):
+        """Redirect settings file to a custom path (e.g. for testing)."""
+        self._file_path = path
+        self.load()
+
+    def reset_file_path(self):
+        """Reset settings file back to default application path."""
+        self._file_path = SETTINGS_FILE
+        self.load()
+
     def load(self) -> Dict[str, Any]:
         """Loads settings from JSON file, falling back to defaults."""
         self._data = dict(DEFAULT_SETTINGS)
-        if os.path.isfile(SETTINGS_FILE):
+        target = self.file_path
+        if os.path.isfile(target):
             try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                with open(target, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                     if isinstance(saved, dict):
                         self._data.update(saved)
@@ -63,13 +79,15 @@ class SettingsManager:
 
     def save(self) -> bool:
         """Saves current settings to JSON file."""
+        target = self.file_path
         try:
-            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
             return True
         except Exception:
             return False
+
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default if default is not None else DEFAULT_SETTINGS.get(key))
