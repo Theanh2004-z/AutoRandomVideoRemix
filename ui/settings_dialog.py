@@ -28,7 +28,7 @@ class SettingsDialog(QDialog):
         title = QLabel('Cài đặt', self)
         title.setObjectName('pageTitle')
         layout.addWidget(title)
-        caption = QLabel('Các lựa chọn được lưu tự động cho những lần xuất sau.', self)
+        caption = QLabel('Tự động ghi nhớ thiết lập, kể cả khi nâng cấp ứng dụng.', self)
         caption.setObjectName('mutedText')
         layout.addWidget(caption)
         self.tabs = QTabWidget(self)

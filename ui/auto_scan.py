@@ -9,6 +9,7 @@ class AutoScanController(QObject):
         super().__init__(panel)
         self.panel, self.media_type = panel, media_type
         self.pending = False
+        self.enabled = True
         self.stopping = False
         self.generation = 0
         self.timer = QTimer(self)
@@ -21,7 +22,7 @@ class AutoScanController(QObject):
             self.timer.start()
 
     def schedule(self, *args):
-        if self.stopping:
+        if self.stopping or not self.enabled:
             return
         self.generation += 1
         worker = self.panel.scanner_thread
@@ -32,7 +33,7 @@ class AutoScanController(QObject):
         self.panel.scan_status_lbl.setText('Sẽ tự kiểm tra thư mục…' if self.panel.folder_edit.text().strip() else 'Chọn thư mục để tự kiểm tra.')
 
     def start(self):
-        if self.stopping:
+        if self.stopping or not self.enabled:
             return
         self.timer.stop()
         panel = self.panel
@@ -65,7 +66,7 @@ class AutoScanController(QObject):
     def current(self, worker):
         return (worker is self.panel.scanner_thread and worker.generation == self.generation
                 and worker.folder == self.panel.folder_edit.text().strip()
-                and worker.recursive == self.panel.chk_recursive.isChecked() and not self.stopping)
+                and worker.recursive == self.panel.chk_recursive.isChecked() and not self.stopping and self.enabled)
 
     def progress(self, current, total, name):
         if self.current(self.sender()):
@@ -84,12 +85,31 @@ class AutoScanController(QObject):
         if panel.scanner_thread is worker:
             panel.scanner_thread = None
             panel.scan_bar.setVisible(False)
-            panel.btn_scan.setEnabled(True)
+            panel.btn_scan.setEnabled(self.enabled)
             panel.scan_state_changed.emit(False)
         worker.deleteLater()
-        if self.pending and not self.stopping:
+        if self.pending and not self.stopping and self.enabled:
             self.pending = False
             self.timer.start(0)
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if self.stopping or self.enabled == enabled:
+            return
+        self.enabled = enabled
+        self.panel.btn_scan.setEnabled(enabled)
+        if not enabled:
+            self.timer.stop()
+            self.pending = False
+            self.generation += 1
+            if self.panel.scanner_thread:
+                self.panel.scanner_thread.cancel()
+            self.panel.scan_bar.hide()
+        elif self.panel.scanner_thread:
+            self.pending = True
+            self.panel.scanner_thread.cancel()
+        elif not (self.panel.valid_videos if self.media_type == "video" else self.panel.valid_audios):
+            self.schedule()
 
     def stop(self):
         self.stopping = True

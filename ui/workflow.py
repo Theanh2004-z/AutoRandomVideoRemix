@@ -390,13 +390,12 @@ class GuidedWorkflow(QWidget):
                     and not self.host._plan_is_stale and not self._finished)
 
     def refresh(self, *args):
-        if not hasattr(self, "next_button"):
+        if not hasattr(self, "settings_button"):
             return
         value = self.inputs()
         readiness = evaluate_readiness(value)
         audio_only = value.target == "audio_only"
-        self.host.source_panel.setVisible(not audio_only)
-        self.host.audio_panel.setVisible(value.target != "video_only")
+        self._refresh_source_visibility(value)
         self.audio_settings_card.setVisible(value.target != "video_only")
         self.host.cut_panel.set_audio_only(audio_only)
         self.host.output_panel.set_audio_only(audio_only)
@@ -423,17 +422,7 @@ class GuidedWorkflow(QWidget):
                 item = self.checks_layout.takeAt(0)
                 item.widget().deleteLater()
             for check in readiness.checks:
-                row = QFrame(self.checks_widget)
-                row.setObjectName("checkRow")
-                row.setProperty("state", check.state)
-                row_layout = QHBoxLayout(row)
-                row_layout.setContentsMargins(14, 10, 14, 10)
-                status = label({"ready": "Đã có", "warning": "Lưu ý", "action": "Cần làm"}[check.state], "checkStatus")
-                status.setFixedWidth(62)
-                row_layout.addWidget(status)
-                detail = ("Đã lập kế hoạch đủ các đoạn theo cấu hình đã chọn." if prepared and check.title == "Độ dài kho video" else check.detail)
-                row_layout.addWidget(label(f"{check.title} — {detail}", "checkDetail"), 1)
-                self.checks_layout.addWidget(row)
+                self.checks_layout.addWidget(self._create_check_row(check, prepared))
         if self._preparing:
             self.plan_notice.setText(self._background_message or "Đang chuẩn bị kế hoạch trong nền…")
         elif self._plan_error:
@@ -448,6 +437,36 @@ class GuidedWorkflow(QWidget):
         self.settings_button.setEnabled(not self._running)
         if self._running and self.settings_dialog.isVisible():
             self.settings_dialog.close()
+        self._refresh_navigation(value, readiness, prepared)
+        self.host.progress_panel.btn_start.setText(f"Bắt đầu xuất {value.batch_count} {unit}")
+        self.host.progress_panel.btn_start.setEnabled(prepared and not self._running and readiness.can_prepare and not self.settings_dialog.cache_busy)
+        self.open_output_button.setEnabled(os.path.isdir(value.output_dir))
+        self.new_run_button.setEnabled(not self._running)
+
+        self.host.progress_panel.btn_build_pool.setVisible(not audio_only)
+        self.host.progress_panel.btn_shuffle.setVisible(not audio_only)
+        self.host.progress_panel.btn_audio_playlist.setVisible(value.target != "video_only")
+        for page in self.pages[:3]:
+            page.setEnabled(not self._running)
+
+    def _refresh_source_visibility(self, value):
+        self.host.source_panel.setVisible(value.target != "audio_only")
+        self.host.audio_panel.setVisible(value.target != "video_only")
+
+    def _create_check_row(self, check, prepared):
+        row = QFrame(self.checks_widget)
+        row.setObjectName("checkRow")
+        row.setProperty("state", check.state)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(14, 10, 14, 10)
+        status = label({"ready": "Đã có", "warning": "Lưu ý", "action": "Cần làm"}[check.state], "checkStatus")
+        status.setFixedWidth(62)
+        row_layout.addWidget(status)
+        detail = ("Đã lập kế hoạch đủ các đoạn theo cấu hình đã chọn." if prepared and check.title == "Độ dài kho video" else check.detail)
+        row_layout.addWidget(label(f"{check.title} — {detail}", "checkDetail"), 1)
+        return row
+
+    def _refresh_navigation(self, value, readiness, prepared):
         index = self.stack.currentIndex()
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
@@ -462,16 +481,6 @@ class GuidedWorkflow(QWidget):
                                  "Kế hoạch đã sẵn sàng." if prepared else readiness.next_action)
         if index == 3 and not self._running:
             self.footer_hint.setText("Kết quả đã sẵn sàng trong thư mục đã chọn." if self._finished else "Kiểm tra nơi lưu, rồi nhấn Bắt đầu xuất." if prepared else "Quay lại bước Kiểm tra để chuẩn bị lượt xuất mới.")
-        self.host.progress_panel.btn_start.setText(f"Bắt đầu xuất {value.batch_count} {unit}")
-        self.host.progress_panel.btn_start.setEnabled(prepared and not self._running and readiness.can_prepare and not self.settings_dialog.cache_busy)
-        self.open_output_button.setEnabled(os.path.isdir(value.output_dir))
-        self.new_run_button.setEnabled(not self._running)
-
-        self.host.progress_panel.btn_build_pool.setVisible(not audio_only)
-        self.host.progress_panel.btn_shuffle.setVisible(not audio_only)
-        self.host.progress_panel.btn_audio_playlist.setVisible(value.target != "video_only")
-        for page in self.pages[:3]:
-            page.setEnabled(not self._running)
 
     def go_to(self, index):
         index = max(0, min(3, index))

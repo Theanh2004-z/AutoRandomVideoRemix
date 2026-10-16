@@ -1,23 +1,21 @@
-"""
-Settings Manager — persists user preferences and directory paths across sessions.
-Stores configuration in a fixed persistent user directory (%APPDATA% on Windows,
-~/.config on Linux/macOS) so settings survive across EXE updates and directory moves.
-"""
-import os
+"""Persistent per-user preferences with legacy migration and atomic writes."""
 import json
-import shutil
-from typing import Any, Dict, Optional
+import math
+import os
+import tempfile
+import threading
+from typing import Any, Dict
 
-from core.app_paths import get_settings_json_path, get_app_dir
+from core.app_paths import get_settings_json_path, get_legacy_settings_paths
+
+SETTINGS_FILE = get_settings_json_path()
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    # ── Thư mục nguồn & quét ──
     "video_folder": "",
     "audio_folder": "",
+    "output_folder": "",
     "recursive_video": False,
     "recursive_audio": False,
-
-    # ── Cắt đoạn & Phân bổ ──
     "segment_duration": 10.0,
     "target_hours": 0,
     "target_mins": 30,
@@ -28,120 +26,200 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "no_repeat_batch": True,
     "no_consecutive_video": True,
     "no_consecutive_audio": True,
-    "trim_last_segment": True,
-    "unique_policy": "unique_batch",
-    "anti_consecutive_policy": "soft",
-    "use_history": False,
-    "auto_reshuffle_audio": True,
-
-    # ── Cấu hình âm thanh ──
     "audio_mode": "fit_target",
     "export_target": "video_with_random_audio",
     "audio_output_format": "mp3",
-    "video_audio_mode": "none",
-    "bgm_path": "",
-
-    # ── Cấu hình xuất video ──
-    "output_folder": "",
-    "output_prefix": "",
     "resolution": "1920x1080",
     "fps": 30,
-    "aspect_ratio_mode": "fit",
-    "quality": "high",
-
-    # ── Tăng tốc & phần cứng ──
     "hw_accel": "auto",
+    "quality": "high",
+    "aspect_ratio_mode": "fit",
+    "video_audio_mode": "none",
+    "bgm_path": "",
+    "output_prefix": "",
     "render_speed": "balanced",
     "parallel_segments": 0,
     "gpu_processing": True,
     "decoder_mode": "auto",
-
-    # ── Bộ nhớ đệm (Cache) ──
+    "trim_last_segment": True,
+    "use_history": False,
+    "unique_policy": "unique_batch",
+    "anti_consecutive_policy": "soft",
+    "auto_reshuffle_audio": True,
     "cache_enabled": True,
     "cache_max_gb": 5,
     "cache_folder": "",
-
-    # ── Giao diện người dùng ──
     "theme": "dark",
 }
 
+_ENUMS = {
+    "audio_mode": {"fit_target", "keep_all"},
+    "export_target": {"video_with_random_audio", "video_only", "audio_only", "none"},
+    "audio_output_format": {"mp3", "m4a", "wav"},
+    "resolution": {"1920x1080", "1280x720", "3840x2160", "1080x1920"},
+    "fps": {24, 25, 30, 60},
+    "hw_accel": {"auto", "cpu", "nvenc", "qsv", "amf"},
+    "quality": {"standard", "high", "very_high"},
+    "aspect_ratio_mode": {"fit", "crop"},
+    "video_audio_mode": {"none", "keep", "bgm"},
+    "render_speed": {"fast", "balanced", "quality"},
+    "parallel_segments": {0, 1, 2},
+    "decoder_mode": {"auto", "gpu", "cpu"},
+    "unique_policy": {None, "unique_batch", "unique_output", "cycle_output"},
+    "anti_consecutive_policy": {None, "soft", "strict", "off"},
+    "theme": {"light", "dark"},
+}
+_RANGES = {
+    "segment_duration": (1, 3600), "target_hours": (0, 48),
+    "target_mins": (0, 59), "target_secs": (0, 59),
+    "batch_count": (1, 100), "cache_max_gb": (1, 500),
+}
+
+
+def _validated(saved):
+    data = dict(DEFAULT_SETTINGS)
+    for key, value in saved.items():
+        if key not in DEFAULT_SETTINGS:
+            data[key] = value
+            continue
+        default = DEFAULT_SETTINGS[key]
+        if key in _ENUMS:
+            if type(value) not in (str, int, type(None)) or value not in _ENUMS[key]:
+                continue
+        elif isinstance(default, bool):
+            if type(value) is not bool:
+                continue
+        elif key in _RANGES:
+            if type(value) not in (int, float) or not math.isfinite(value):
+                continue
+            low, high = _RANGES[key]
+            if not low <= value <= high or (type(default) is int and int(value) != value):
+                continue
+            value = type(default)(value)
+        elif isinstance(default, str) and not isinstance(value, str):
+            continue
+        data[key] = value
+    if "unique_policy" not in saved and "allow_reuse" in saved:
+        data["unique_policy"] = "cycle_output" if data["allow_reuse"] else "unique_batch" if data["no_repeat_batch"] else "unique_output"
+    if "anti_consecutive_policy" not in saved and "no_consecutive_video" in saved:
+        data["anti_consecutive_policy"] = "soft" if data["no_consecutive_video"] else "off"
+    return data
+
+
+def _read_settings(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            data = json.load(handle, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _atomic_write(path, data):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".remix-settings-", suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump(data, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary and os.path.isfile(temporary):
+            os.unlink(temporary)
+
 
 class SettingsManager:
-    """Singleton-style settings manager for reading and writing user preferences."""
-
+    """Shared preferences; changing a control saves immediately and safely."""
     _instance = None
 
     def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls)
-            cls._instance._file_path: Optional[str] = None
-            cls._instance._data = {}
-            cls._instance.load()
+        if cls._instance is None:
+            instance = super().__new__(cls)
+            instance._lock = threading.RLock()
+            instance._file_path = None
+            instance._allow_migration = True
+            instance._data = {}
+            instance.last_error = ""
+            instance.load()
+            cls._instance = instance
         return cls._instance
 
     @property
-    def file_path(self) -> str:
+    def file_path(self):
         return self._file_path or get_settings_json_path()
 
-    def set_file_path(self, path: Optional[str]):
-        """Redirect settings file to a custom path (e.g. for testing)."""
-        self._file_path = path
-        self.load()
+    def set_file_path(self, path):
+        """Use an isolated path without importing another installation's data."""
+        if path is None:
+            return self.reset_file_path()
+        with self._lock:
+            self._file_path = os.fspath(path)
+            self._allow_migration = False
+            self.load()
 
     def reset_file_path(self):
-        """Reset settings file back to default persistent path."""
-        self._file_path = None
-        self.load()
+        with self._lock:
+            self._file_path = None
+            self._allow_migration = True
+            self.load()
 
-    def load(self) -> Dict[str, Any]:
-        """Loads settings from JSON file, falling back to defaults."""
-        self._data = dict(DEFAULT_SETTINGS)
-        target = self.file_path
+    def load(self):
+        with self._lock:
+            target = self.file_path
+            self.last_error = ""
+            saved = _read_settings(target)
+            restore = False
+            if saved is None:
+                saved = _read_settings(target + ".bak")
+                restore = saved is not None
+            # Never replace an existing shared file with older installation data.
+            if saved is None and self._allow_migration and not os.path.exists(target):
+                for legacy in get_legacy_settings_paths():
+                    if os.path.abspath(legacy) == os.path.abspath(target):
+                        continue
+                    saved = _read_settings(legacy)
+                    if saved is not None:
+                        restore = True
+                        break
+            self._data = _validated(saved or {})
+            if restore:
+                self.save()
+            return self._data
 
-        # If persistent file doesn't exist yet, check if legacy file exists in local app dir
-        if not os.path.isfile(target):
-            legacy_file = os.path.join(get_app_dir(), "user_settings.json")
-            if os.path.isfile(legacy_file) and os.path.abspath(legacy_file) != os.path.abspath(target):
-                try:
-                    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-                    shutil.copy2(legacy_file, target)
-                except Exception:
-                    pass
-
-        if os.path.isfile(target):
+    def save(self):
+        with self._lock:
             try:
-                with open(target, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    if isinstance(saved, dict):
-                        self._data.update(saved)
-            except Exception:
-                pass
-        return self._data
+                # A valid previous version remains recoverable if a later file is damaged.
+                previous = _read_settings(self.file_path)
+                if previous is not None:
+                    _atomic_write(self.file_path + ".bak", previous)
+                _atomic_write(self.file_path, self._data)
+                self.last_error = ""
+                return True
+            except (OSError, ValueError, TypeError) as error:
+                self.last_error = str(error)
+                return False
 
-    def save(self) -> bool:
-        """Saves current settings to JSON file."""
-        target = self.file_path
-        try:
-            os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-            with open(target, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception:
-            return False
+    def get(self, key, default=None):
+        with self._lock:
+            return self._data.get(key, default if default is not None else DEFAULT_SETTINGS.get(key))
 
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._data.get(key, default if default is not None else DEFAULT_SETTINGS.get(key))
+    def set(self, key, value, auto_save=True):
+        with self._lock:
+            self._data[key] = value
+            if auto_save:
+                self.save()
 
-    def set(self, key: str, value: Any, auto_save: bool = True):
-        self._data[key] = value
-        if auto_save:
-            self.save()
-
-    def update(self, mapping: Dict[str, Any], auto_save: bool = True):
-        self._data.update(mapping)
-        if auto_save:
-            self.save()
+    def update(self, mapping, auto_save=True):
+        with self._lock:
+            self._data.update(mapping)
+            if auto_save:
+                self.save()
 
 
-# Global helper instance
 settings = SettingsManager()

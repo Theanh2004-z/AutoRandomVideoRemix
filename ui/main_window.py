@@ -70,13 +70,14 @@ from ui.components.output_config_panel import OutputConfigPanel
 from ui.components.progress_panel import ProgressPanel
 from ui.components.cut_table_view import CutTableView
 from ui.styles import GLOBAL_STYLE_SHEET
-from ui.workflow import GuidedWorkflow
+from ui.dashboard import DashboardWorkflow
+from ui.window_frame import RemixWindow
 from core.settings_manager import settings
 from core.render_cache import RenderCache
 from core.app_paths import get_cache_dir
 
 
-class MainWindow(QMainWindow):
+class MainWindow(RemixWindow):
     """Main Application Window."""
 
     def __init__(self):
@@ -102,9 +103,9 @@ class MainWindow(QMainWindow):
         saved_theme = settings.get("theme", "dark")
         if Theme is not None:
             if saved_theme == "light":
-                setTheme(Theme.LIGHT)
+                setTheme(Theme.LIGHT, save=False)
             else:
-                setTheme(Theme.DARK)
+                setTheme(Theme.DARK, save=False)
 
         self._init_ui()
         self._connect_signals()
@@ -118,7 +119,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _init_ui(self):
-        self.workflow = GuidedWorkflow(self)
+        self.workflow = DashboardWorkflow(self)
         self.setCentralWidget(self.workflow)
         if Theme is not None:
             self.workflow.apply_theme(isDarkTheme())
@@ -126,19 +127,21 @@ class MainWindow(QMainWindow):
     def _toggle_theme(self):
         new_is_dark = not isDarkTheme()
         if Theme is not None:
-            setTheme(Theme.DARK if new_is_dark else Theme.LIGHT)
+            setTheme(Theme.DARK if new_is_dark else Theme.LIGHT, save=False)
         settings.set("theme", "dark" if new_is_dark else "light")
         self.workflow.apply_theme(new_is_dark)
 
     def _auto_restore_sessions(self):
         """Restores video and audio sources if previously configured folders exist."""
+        if self._closing_requested:
+            return
         vid_dir = settings.get("video_folder", "").strip()
-        if vid_dir and os.path.isdir(vid_dir) and not self.source_videos:
+        if vid_dir and os.path.isdir(vid_dir) and not self.source_videos and self.source_panel.auto_scan.enabled and not self.source_panel.auto_scan.timer.isActive() and not (self.source_panel.scanner_thread and self.source_panel.scanner_thread.isRunning()):
             self.progress_panel.log("INFO", f"📂 Tự động khôi phục video từ: {vid_dir}")
             self.source_panel._start_scan()
 
         aud_dir = settings.get("audio_folder", "").strip()
-        if aud_dir and os.path.isdir(aud_dir) and (not self.audio_pool or self.audio_pool.total_tracks == 0):
+        if aud_dir and os.path.isdir(aud_dir) and (not self.audio_pool or self.audio_pool.total_tracks == 0) and self.audio_panel.auto_scan.enabled and not self.audio_panel.auto_scan.timer.isActive() and not (self.audio_panel.scanner_thread and self.audio_panel.scanner_thread.isRunning()):
             self.progress_panel.log("INFO", f"🎵 Tự động khôi phục âm thanh từ: {aud_dir}")
             self.audio_panel._start_scan()
 

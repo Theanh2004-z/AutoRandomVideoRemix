@@ -7,7 +7,9 @@ Supports automatic migration of legacy configuration and isolated directories fo
 """
 import os
 import sys
-import shutil
+import sqlite3
+import tempfile
+from contextlib import closing
 from typing import Optional
 
 _TEST_DATA_DIR: Optional[str] = None
@@ -71,9 +73,27 @@ def get_data_dir() -> str:
     target_db = os.path.join(persistent_dir, "export_history.db")
     if not os.path.isfile(target_db) and os.path.isfile(legacy_db):
         try:
-            shutil.copy2(legacy_db, target_db)
+            descriptor, temporary = tempfile.mkstemp(prefix=".remix-history-", suffix=".db", dir=persistent_dir)
+            os.close(descriptor)
+            try:
+                from pathlib import Path
+                with closing(sqlite3.connect(Path(legacy_db).resolve().as_uri() + "?mode=ro", uri=True)) as source:
+                    with closing(sqlite3.connect(temporary)) as destination:
+                        source.backup(destination)
+                # Install only if another app has not already created the shared DB.
+                try:
+                    if os.name == "nt":
+                        os.rename(temporary, target_db)  # Windows rename refuses to replace an existing file.
+                    else:
+                        os.link(temporary, target_db)
+                except FileExistsError:
+                    pass
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
         except Exception:
-            pass
+            if not os.path.isfile(target_db):
+                return os.path.dirname(legacy_db)
 
     return persistent_dir
 
@@ -84,25 +104,23 @@ def get_history_db_path() -> str:
 
 
 def get_settings_json_path() -> str:
-    """
-    Returns the path to user_settings.json in the persistent user directory.
-    Automatically imports old settings from local app_dir if present.
-    """
-    global _TEST_DATA_DIR
+    """Permanent user preferences; migration is handled atomically by the manager."""
     if _TEST_DATA_DIR:
         return os.path.join(_TEST_DATA_DIR, "user_settings.json")
+    return os.path.join(get_persistent_data_dir(), "user_settings.json")
 
-    persistent_settings = os.path.join(get_persistent_data_dir(), "user_settings.json")
-    if not os.path.isfile(persistent_settings):
-        # Auto-migrate from legacy local app directory if exists
-        local_settings = os.path.join(get_app_dir(), "user_settings.json")
-        if os.path.isfile(local_settings):
-            try:
-                shutil.copy2(local_settings, persistent_settings)
-            except Exception:
-                pass
 
-    return persistent_settings
+def get_legacy_settings_paths():
+    """Previous application-local locations; tests never import real user data."""
+    if _TEST_DATA_DIR:
+        return []
+    app_dir = get_app_dir()
+    paths = [os.path.join(app_dir, "user_settings.json")]
+    if getattr(sys, "frozen", False):
+        paths.append(os.path.join(app_dir, "_internal", "user_settings.json"))
+        if hasattr(sys, "_MEIPASS"):
+            paths.append(os.path.join(sys._MEIPASS, "user_settings.json"))
+    return list(dict.fromkeys(paths))
 
 
 def get_cache_dir() -> str:

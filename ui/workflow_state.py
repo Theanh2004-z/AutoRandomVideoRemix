@@ -39,6 +39,8 @@ class WorkflowReadiness:
 
 
 def evaluate_readiness(value: WorkflowInputs) -> WorkflowReadiness:
+    if value.target == "none":
+        return WorkflowReadiness(False, False, (ReadinessCheck("Nguồn xuất", "Tích Video hoặc Âm thanh để chọn nội dung cần xuất.", "action"),))
     checks = []
     video_needed = value.target != "audio_only"
     audio_needed = value.target in ("audio_only", "video_with_random_audio")

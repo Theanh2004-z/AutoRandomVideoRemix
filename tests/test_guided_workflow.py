@@ -219,6 +219,11 @@ class GuidedWorkflowTests(unittest.TestCase):
         self.win.output_panel.combo_parallel.setCurrentIndex(self.win.output_panel.combo_parallel.findData(2))
         self.win.output_panel.chk_gpu_processing.setChecked(False)
         self.win.output_panel.combo_decoder.setCurrentIndex(self.win.output_panel.combo_decoder.findData('cpu'))
+        from qfluentwidgets import isDarkTheme
+        if not isDarkTheme():
+            self.win._toggle_theme()
+        settings._data={}
+        settings.load()
         from ui.main_window import MainWindow
         reopened=MainWindow()
         try:
@@ -230,6 +235,8 @@ class GuidedWorkflowTests(unittest.TestCase):
             self.assertEqual(reopened.output_panel.get_config().parallel_segments,2)
             self.assertFalse(reopened.output_panel.get_config().gpu_processing)
             self.assertEqual(reopened.output_panel.get_config().decoder_mode,'cpu')
+            from qfluentwidgets import isDarkTheme
+            self.assertTrue(isDarkTheme())
         finally:
             reopened.close()
             reopened.deleteLater()
@@ -297,9 +304,10 @@ class GuidedWorkflowTests(unittest.TestCase):
         self.assertTrue(self.flow.validated(), self.flow.plan_notice.text())
 
     def test_empty_sources_explain_why_and_cannot_skip_to_export(self):
-        self.assertFalse(self.flow.next_button.isEnabled())
+        self.assertFalse(self.flow.confirm_button.isEnabled())
         self.flow.go_to(3)
-        self.assertEqual(self.flow.stack.currentIndex(), 2)
+        self.assertEqual(self.flow.export_stack.currentIndex(), 0)
+        self.assertTrue(self.flow.export_dialog.isVisible())
         self.assertFalse(self.win.progress_panel.btn_start.isEnabled())
         self.assertIn('quét video', self.flow.footer_hint.text())
 
@@ -313,14 +321,16 @@ class GuidedWorkflowTests(unittest.TestCase):
             self.flow.prepare()
             self.await_preparation()
         self.assertTrue(self.flow.validated())
-        self.assertTrue(self.win.source_panel.isHidden())
+        self.assertFalse(self.flow.video_toggle.isChecked())
+        self.assertTrue(self.flow.video_body.isHidden())
+        self.assertFalse(self.win.source_panel.isHidden())
         self.assertTrue(self.win.output_panel.video_options.isHidden())
         self.assertEqual(len(self.win.current_audio_playlists), 2)
 
     def test_review_opens_export_only_after_real_plan_is_built(self):
         self.prepare()
         self.flow.go_to(3)
-        self.assertEqual(self.flow.stack.currentIndex(), 3)
+        self.assertTrue(self.flow.export_dialog.isVisible())
         self.assertTrue(self.win.progress_panel.btn_start.isEnabled())
         self.assertEqual(len(self.win.current_batch_plans), 1)
 
@@ -377,7 +387,7 @@ class GuidedWorkflowTests(unittest.TestCase):
     def test_running_job_locks_settings_and_failed_job_requires_review(self):
         self.prepare()
         self.win.progress_panel.set_running_state(True)
-        self.assertEqual(self.flow.stack.currentIndex(), 3)
+        self.assertTrue(self.flow.export_dialog.isVisible())
         self.assertFalse(self.flow.pages[1].isEnabled())
         self.assertFalse(self.win.progress_panel.btn_start.isEnabled())
         self.flow.finished(0, 1)
@@ -390,6 +400,6 @@ class GuidedWorkflowTests(unittest.TestCase):
         self.assertIn('hoàn tất', self.flow.result_label.text())
         self.assertFalse(self.win.progress_panel.btn_start.isEnabled())
         self.flow.new_run()
-        self.assertEqual(self.flow.stack.currentIndex(), 1)
+        self.assertFalse(self.flow.export_dialog.isVisible())
         self.assertFalse(self.flow.validated())
         self.assertEqual(len(self.win.source_videos), 1)

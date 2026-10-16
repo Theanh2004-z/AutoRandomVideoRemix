@@ -39,9 +39,7 @@ def main():
     app.setApplicationName("AutoRandomVideoRemix")
     app.setOrganizationName("Antigravity")
 
-    # Set modern Light theme as default (user can switch in header)
-    setTheme(Theme.LIGHT)
-
+    # MainWindow restores the saved theme before constructing its controls.
     window = MainWindow()
     window.show()
 

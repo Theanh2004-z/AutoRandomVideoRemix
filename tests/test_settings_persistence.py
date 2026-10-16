@@ -12,6 +12,8 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
+from core import app_paths
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,15 +27,21 @@ from core.settings_manager import SettingsManager, DEFAULT_SETTINGS
 class TestSettingsPersistence(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix="remix_settings_test_")
-        set_test_data_dir(self.temp_dir)
+        self.path_patch = patch.object(app_paths, "_TEST_DATA_DIR", self.temp_dir)
+        self.path_patch.start()
         # Point settings to test path
         self.test_settings_file = os.path.join(self.temp_dir, "user_settings.json")
         self.mgr = SettingsManager()
+        self.previous_path = self.mgr._file_path
+        self.previous_data = dict(self.mgr._data)
+        self.previous_migration = self.mgr._allow_migration
         self.mgr.set_file_path(self.test_settings_file)
 
     def tearDown(self):
-        self.mgr.reset_file_path()
-        reset_data_dir()
+        self.mgr._file_path = self.previous_path
+        self.mgr._data = self.previous_data
+        self.mgr._allow_migration = self.previous_migration
+        self.path_patch.stop()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_default_settings_keys(self):
@@ -106,9 +114,10 @@ class TestSettingsPersistence(unittest.TestCase):
             # Test SettingsManager migration logic when file does not exist
             mgr = SettingsManager()
             from unittest.mock import patch
-            with patch("core.settings_manager.get_app_dir", return_value=os.path.dirname(legacy_source)):
-                mgr.set_file_path(persistent_target)
-                loaded = mgr.load()
+            with patch("core.settings_manager.get_settings_json_path", return_value=persistent_target), \
+                 patch("core.settings_manager.get_legacy_settings_paths", return_value=[legacy_source]):
+                mgr.reset_file_path()
+                loaded = dict(mgr.load())
 
             self.assertTrue(os.path.isfile(persistent_target), "Legacy settings must be copied to persistent target")
             self.assertEqual(loaded.get("video_folder"), "C:/OldVersion/Videos")
@@ -120,15 +129,15 @@ class TestSettingsPersistence(unittest.TestCase):
     def test_persistent_paths_resolution(self):
         """Verifies that persistent data and settings paths resolve to valid directories."""
         # Under normal conditions (without test data dir), persistent path uses APPDATA or ~/.config
-        reset_data_dir()
-        p_dir = get_persistent_data_dir()
-        self.assertTrue(os.path.isdir(p_dir))
-
-        s_path = get_settings_json_path()
-        self.assertTrue(s_path.startswith(p_dir))
-
-        c_dir = get_cache_dir()
-        self.assertTrue(c_dir.startswith(p_dir))
+        with patch.object(app_paths, "_TEST_DATA_DIR", None), \
+             patch.dict(os.environ, {"APPDATA": os.path.join(self.temp_dir, "appdata")}):
+            p_dir = get_persistent_data_dir()
+            self.assertTrue(os.path.isdir(p_dir))
+            self.assertTrue(p_dir.startswith(self.temp_dir))
+            s_path = get_settings_json_path()
+            self.assertTrue(s_path.startswith(p_dir))
+            c_dir = get_cache_dir()
+            self.assertTrue(c_dir.startswith(p_dir))
 
 
 if __name__ == "__main__":

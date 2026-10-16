@@ -137,3 +137,25 @@ QLabel#sectionHeader {
     color: #1A1A1A;
 }
 """
+
+
+def dashboard_style_sheet(dark=False):
+    surface = "#20262F" if dark else "#FFFFFF"
+    line = "#35404D" if dark else "#E2E7EE"
+    canvas = "#15191F" if dark else "#F4F6FA"
+    accent = "#75B4FF" if dark else "#2465B7"
+    return workflow_style_sheet(dark) + f"""
+    QWidget#dashboardCanvas, QWidget#dashboardColumn {{ background: {canvas}; }}
+    QWidget#dashboardHeader {{ background: {surface}; border-bottom: 1px solid {line}; }}
+    QLabel#brandMark {{ background: #2465B7; color: white; border-radius: 10px; font-size: 23px; font-weight: 700; }}
+    QLabel#dashboardBrand {{ color: {accent}; font-size: 18px; font-weight: 700; letter-spacing: 2px; }}
+    QLabel#dashboardSummary {{ font-size: 15px; font-weight: 600; }}
+    QCheckBox#sourceToggle {{ font-size: 16px; font-weight: 600; spacing: 9px; }}
+    QWidget#titleBarContent {{ background: transparent; }}
+    QLabel#sessionHint {{ padding: 10px; font-size: 14px; }}
+    QLabel#planNotice {{ padding: 1px 0; font-size: 12px; }}
+    QLabel#exportSummary {{ padding: 0 0 5px; font-size: 13px; }}
+    QLabel#exportPreview {{ background: #10161F; color: #A8B9D0; border-radius: 9px; font-size: 19px; }}
+    QLabel#statNumber {{ font-size: 20px; }}
+    QFrame#checkRow {{ border-radius: 6px; }}
+    """

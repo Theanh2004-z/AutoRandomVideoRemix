@@ -43,8 +43,11 @@ class TestV3ReviewFixes(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix="remix_review_test_")
+        self.path_patch = patch("core.app_paths._TEST_DATA_DIR", self.temp_dir)
+        self.path_patch.start()
 
     def tearDown(self):
+        self.path_patch.stop()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # -----------------------------------------------------------------

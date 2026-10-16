@@ -166,6 +166,7 @@ class AudioPanel(CardWidget):
         self.combo_export_target.addItem("🎬 Ghép Video + Âm thanh ngẫu nhiên (Hoàn chỉnh MP4)", userData="video_with_random_audio")
         self.combo_export_target.addItem("🎵 Chỉ xuất Âm thanh ngẫu nhiên (File Audio độc lập)", userData="audio_only")
         self.combo_export_target.addItem("🎞 Xuất Video theo cấu hình Khu vực C (Âm thanh gốc / BGM / Tắt tiếng)", userData="video_only")
+        self.combo_export_target.addItem("Không chọn nguồn", userData="none")
         saved_export = settings.get("export_target", "video_with_random_audio")
         idx_exp = self.combo_export_target.findData(saved_export)
         if idx_exp >= 0:
