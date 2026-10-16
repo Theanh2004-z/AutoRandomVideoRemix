@@ -6,7 +6,7 @@ import re
 from typing import Optional, Tuple
 
 APP_NAME = "AutoRandomVideoRemix"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 RELEASE_CHANNEL = "stable"  # "stable" | "beta"
 GITHUB_REPO = "Theanh2004-z/AutoRandomVideoRemix"
 GITHUB_LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
