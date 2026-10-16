@@ -132,3 +132,53 @@ def get_cache_dir() -> str:
         cache_dir = os.path.join(get_persistent_data_dir(), "cache")
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
+
+
+def get_default_scratch_dir() -> str:
+    """
+    Returns default temporary processing scratch directory on fast local storage (SSD C:).
+    Uses LOCALAPPDATA / Temp if available.
+    """
+    global _TEST_DATA_DIR
+    if _TEST_DATA_DIR:
+        scratch = os.path.join(_TEST_DATA_DIR, "scratch")
+    else:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            scratch = os.path.join(local_appdata, "AutoRandomVideoRemix", "scratch")
+        else:
+            scratch = os.path.join(tempfile.gettempdir(), "AutoRandomVideoRemix_scratch")
+    os.makedirs(scratch, exist_ok=True)
+    return scratch
+
+
+def get_scratch_dir() -> str:
+    """Returns active scratch directory, respecting persistent user settings."""
+    try:
+        from core.settings_manager import settings
+        configured = (settings.get("scratch_folder", "") or "").strip()
+        if configured:
+            os.makedirs(configured, exist_ok=True)
+            return configured
+    except Exception:
+        pass
+    return get_default_scratch_dir()
+
+
+def get_updates_dir() -> str:
+    """
+    Returns the update download and staging directory under %LOCALAPPDATA%/AutoRandomVideoRemix/updates.
+    Completely isolated from render cache and scratch space.
+    """
+    global _TEST_DATA_DIR
+    if _TEST_DATA_DIR:
+        updates = os.path.join(_TEST_DATA_DIR, "updates")
+    else:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            updates = os.path.join(local_appdata, "AutoRandomVideoRemix", "updates")
+        else:
+            updates = os.path.join(get_persistent_data_dir(), "updates")
+    os.makedirs(updates, exist_ok=True)
+    return updates
+

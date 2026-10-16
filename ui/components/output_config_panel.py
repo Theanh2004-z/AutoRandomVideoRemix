@@ -24,14 +24,17 @@ class OutputConfigPanel(CardWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._aspect_ratio_mode = settings.get("aspect_ratio_mode", "fit")
+        if self._aspect_ratio_mode not in ("crop", "fit"):
+            self._aspect_ratio_mode = "fit"
         self._init_ui()
-        for combo in (self.combo_res, self.combo_fps, self.combo_aspect, self.combo_hw, self.combo_quality, self.combo_audio, self.combo_speed, self.combo_parallel, self.combo_decoder):
+        for combo in (self.combo_res, self.combo_fps, self.combo_hw, self.combo_quality, self.combo_audio, self.combo_speed, self.combo_parallel, self.combo_decoder):
             combo.currentIndexChanged.connect(lambda *args: self.config_changed.emit())
         self.edit_outdir.textChanged.connect(lambda *args: self.config_changed.emit())
         self.edit_prefix.textChanged.connect(lambda *args: self.config_changed.emit())
         self.edit_bgm.textChanged.connect(lambda *args: self.config_changed.emit())
         self.chk_gpu_processing.toggled.connect(lambda *args: self.config_changed.emit())
-        for combo, key in ((self.combo_quality, 'quality'), (self.combo_aspect, 'aspect_ratio_mode'),
+        for combo, key in ((self.combo_quality, 'quality'),
                            (self.combo_audio, 'video_audio_mode')):
             index = combo.findData(settings.get(key, combo.currentData()))
             if index >= 0:
@@ -87,16 +90,7 @@ class OutputConfigPanel(CardWidget):
         advanced_grid.addWidget(lbl_fps, 0, 0)
         advanced_grid.addWidget(self.combo_fps, 0, 1)
 
-        # 3. Aspect Ratio Handling
-        lbl_ar = QLabel("Xử lý tỷ lệ khung hình:")
-        lbl_ar.setStyleSheet("font-weight: 500;")
-        self.combo_aspect = ComboBox(self)
-        self.combo_aspect.addItem("Giữ đủ hình + Viền đen (Fit / Letterbox) [Mặc định]", userData="fit")
-        self.combo_aspect.addItem("Phóng to lấp đầy khung (Crop / Fill)", userData="crop")
-        advanced_grid.addWidget(lbl_ar, 1, 0)
-        advanced_grid.addWidget(self.combo_aspect, 1, 1)
-
-        # 4. Hardware Acceleration
+        # 3. Hardware Acceleration
         # Hardware probing happens in the export worker, not while opening UI.
 
         lbl_hw = QLabel("Mã hóa phần cứng:")
@@ -113,15 +107,15 @@ class OutputConfigPanel(CardWidget):
         if idx_hw >= 0:
             self.combo_hw.setCurrentIndex(idx_hw)
         self.combo_hw.currentIndexChanged.connect(lambda: settings.set("hw_accel", self.combo_hw.currentData()))
-        advanced_grid.addWidget(lbl_hw, 2, 0)
-        advanced_grid.addWidget(self.combo_hw, 2, 1)
+        advanced_grid.addWidget(lbl_hw, 1, 0)
+        advanced_grid.addWidget(self.combo_hw, 1, 1)
 
         # Detected GPU Info Badge
         self.lbl_gpu_detected = QLabel(self)
         self.lbl_gpu_detected.setObjectName('mutedText')
         self.lbl_gpu_detected.setWordWrap(True)
         self.lbl_gpu_detected.setText('Chế độ Tự động sẽ kiểm tra bộ mã hóa trong nền khi bắt đầu xuất.')
-        advanced_grid.addWidget(self.lbl_gpu_detected, 3, 1)
+        advanced_grid.addWidget(self.lbl_gpu_detected, 2, 1)
 
         # 5. Quality Preset
         lbl_qual = QLabel("Chất lượng xuất:")
@@ -296,11 +290,19 @@ class OutputConfigPanel(CardWidget):
         else:
             subprocess.run(["open" if os.name == "darwin" else "xdg-open", d])
 
+    def set_aspect_mode(self, mode: str):
+        if mode not in ("crop", "fit"):
+            mode = "fit"
+        if self._aspect_ratio_mode != mode:
+            self._aspect_ratio_mode = mode
+            settings.set("aspect_ratio_mode", mode)
+            self.config_changed.emit()
+
     def get_config(self) -> OutputConfig:
         return OutputConfig(
             resolution=self.combo_res.currentData(),
             fps=self.combo_fps.currentData(),
-            aspect_ratio_mode=self.combo_aspect.currentData(),
+            aspect_ratio_mode=self._aspect_ratio_mode,
             hw_accel=self.combo_hw.currentData(),
             quality=self.combo_quality.currentData(),
             render_speed=self.combo_speed.currentData(),

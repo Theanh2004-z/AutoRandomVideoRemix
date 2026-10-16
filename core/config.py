@@ -44,6 +44,15 @@ class VideoInfo:
     color_transfer: str = ""
     sample_aspect_ratio: str = "1:1"
     time_base: str = ""
+    rotation: int = 0
+
+    @property
+    def display_width(self) -> int:
+        return self.height if abs(self.rotation) in (90, 270) else self.width
+
+    @property
+    def display_height(self) -> int:
+        return self.width if abs(self.rotation) in (90, 270) else self.height
 
     @property
     def formatted_duration(self) -> str:

@@ -4,6 +4,7 @@ Handles Action Buttons (Start, Pause, Resume, Cancel), Progress Bars,
 and Real-Time Syntax-Colored Log Console.
 """
 import time
+from typing import Optional
 from html import escape
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -82,7 +83,9 @@ class ProgressPanel(CardWidget):
         layout.addWidget(self.prep_widget)
 
         # Action Buttons Row (Area D)
-        btn_layout = QHBoxLayout()
+        self.action_widget = QWidget(self)
+        btn_layout = QHBoxLayout(self.action_widget)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.setSpacing(10)
 
         self.btn_start = PrimaryPushButton("BẮT ĐẦU XUẤT (RENDER)", self)
@@ -104,19 +107,68 @@ class ProgressPanel(CardWidget):
         btn_layout.addWidget(self.btn_start, 2)
         btn_layout.addWidget(self.btn_pause, 1)
         btn_layout.addWidget(self.btn_cancel, 1)
-        layout.addLayout(btn_layout)
+        layout.addWidget(self.action_widget)
 
-        # Progress Bars (Area E)
+        # Progress Bars (Area E) - CapCut style dual horizontal bars
         prog_layout = QVBoxLayout()
-        prog_layout.setSpacing(6)
+        prog_layout.setSpacing(10)
 
         # Overall Progress
-        self.lbl_overall = QLabel("Tiến độ tổng thể: Sẵn sàng")
-        self.lbl_overall.setStyleSheet("font-weight: 600;")
-        self.bar_overall = ProgressBar(self)
-        self.bar_overall.setValue(0)
+        self.lbl_overall = QLabel("Tiến độ: Sẵn sàng")
+        self.lbl_overall.setObjectName("progressStatusLabel")
+        self.lbl_overall.setStyleSheet("font-weight: 600; font-size: 13px;")
         prog_layout.addWidget(self.lbl_overall)
-        prog_layout.addWidget(self.bar_overall)
+
+        # 1. Video Progress Bar
+        self.video_container = QWidget(self)
+        self.video_box_widget = self.video_container
+        video_box = QVBoxLayout(self.video_container)
+        video_box.setContentsMargins(0, 0, 0, 0)
+        video_box.setSpacing(4)
+        video_header = QHBoxLayout()
+        self.lbl_video_title = QLabel("Video")
+        self.lbl_video_title.setObjectName("progressSubTitle")
+        self.lbl_video_title.setStyleSheet("font-weight: 600; font-size: 12px;")
+        self.lbl_video_val = QLabel("0%")
+        self.lbl_video_val.setObjectName("progressSubVal")
+        self.lbl_video_val.setStyleSheet("font-weight: 600; font-size: 12px; color: #00B4D8;")
+        video_header.addWidget(self.lbl_video_title)
+        video_header.addStretch()
+        video_header.addWidget(self.lbl_video_val)
+        video_box.addLayout(video_header)
+
+        self.bar_video = ProgressBar(self.video_container)
+        self.bar_video.setValue(0)
+        self.bar_video.setFixedHeight(8)
+        video_box.addWidget(self.bar_video)
+        prog_layout.addWidget(self.video_container)
+
+        # 2. Audio Progress Bar
+        self.audio_container = QWidget(self)
+        self.audio_box_widget = self.audio_container
+        audio_box = QVBoxLayout(self.audio_container)
+        audio_box.setContentsMargins(0, 0, 0, 0)
+        audio_box.setSpacing(4)
+        audio_header = QHBoxLayout()
+        self.lbl_audio_title = QLabel("Âm thanh")
+        self.lbl_audio_title.setObjectName("progressSubTitle")
+        self.lbl_audio_title.setStyleSheet("font-weight: 600; font-size: 12px;")
+        self.lbl_audio_val = QLabel("0%")
+        self.lbl_audio_val.setObjectName("progressSubVal")
+        self.lbl_audio_val.setStyleSheet("font-weight: 600; font-size: 12px; color: #10B981;")
+        audio_header.addWidget(self.lbl_audio_title)
+        audio_header.addStretch()
+        audio_header.addWidget(self.lbl_audio_val)
+        audio_box.addLayout(audio_header)
+
+        self.bar_audio = ProgressBar(self.audio_container)
+        self.bar_audio.setValue(0)
+        self.bar_audio.setFixedHeight(8)
+        audio_box.addWidget(self.bar_audio)
+        prog_layout.addWidget(self.audio_container)
+
+        # Backward compatibility alias
+        self.bar_overall = self.bar_video
 
         # Video progress / segment count info
         stats_row = QHBoxLayout()
@@ -215,12 +267,56 @@ class ProgressPanel(CardWidget):
         self.btn_pause.setStyleSheet("")
         if running:
             self.start_time = time.time()
-            self.bar_overall.setValue(0)
+            self.reset_bars()
+            self.lbl_overall.setText("Đang khởi động tiến trình...")
         self.running_changed.emit(running)
 
+    def reset_bars(self):
+        """Reset both progress bars to 0%."""
+        self.bar_video.setValue(0)
+        self.lbl_video_val.setText("0%")
+        self.bar_audio.setValue(0)
+        self.lbl_audio_val.setText("0%")
+
+    def update_video_progress(self, percent: float):
+        """Update video progress bar directly from processor percent."""
+        pct = max(0, min(100, int(round(float(percent)))))
+        self.bar_video.setValue(pct)
+        self.lbl_video_val.setText(f"{pct}%")
+
+    def update_audio_progress(self, percent: float):
+        """Update audio progress bar directly from processor percent."""
+        pct = max(0, min(100, int(round(float(percent)))))
+        self.bar_audio.setValue(pct)
+        self.lbl_audio_val.setText(f"{pct}%")
+
+    def set_export_mode(self, target: str = "video_with_random_audio", has_audio: Optional[bool] = None, audio_mode: Optional[str] = None):
+        """
+        Configure visibility of Video and Audio progress bars based on export mode:
+        - 'audio_only': hide Video bar, show Audio bar.
+        - 'video_only': show Video bar, hide Audio bar if no audio processing.
+        - 'video_with_random_audio': show both Video and Audio bars.
+        """
+        if has_audio is None:
+            if audio_mode is not None:
+                has_audio = (audio_mode not in ("none", "mute"))
+            else:
+                has_audio = True
+
+        if target == "audio_only":
+            self.video_container.setVisible(False)
+            self.audio_container.setVisible(True)
+        elif target == "video_only":
+            self.video_container.setVisible(True)
+            self.audio_container.setVisible(bool(has_audio))
+        else:
+            self.video_container.setVisible(True)
+            self.audio_container.setVisible(True)
+
     def update_overall_progress(self, percent: float, status_msg: str):
-        self.bar_overall.setValue(int(percent))
-        self.lbl_overall.setText(f"Tiến độ: {int(percent)}% - {status_msg}")
+        pct = max(0.0, min(100.0, float(percent)))
+        self.lbl_overall.setText(f"Tiến độ: {int(pct)}% · {status_msg}")
+
         if self.start_time > 0:
             elapsed = int(time.time() - self.start_time)
             m, s = divmod(elapsed, 60)
@@ -233,6 +329,9 @@ class ProgressPanel(CardWidget):
     def update_stats(self, cur_video: int, total_videos: int, cur_seg: int, total_segs: int):
         self.lbl_video_info.setText(f"Video: {cur_video}/{total_videos}")
         self.lbl_segment_info.setText(f"Đoạn: {cur_seg}/{total_segs}")
+        if total_segs > 0 and cur_seg > 0:
+            v_pct = min(100.0, max(0.0, (cur_seg / total_segs) * 100.0))
+            self.update_video_progress(v_pct)
 
     def set_logs_visible(self, visible: bool):
         self.btn_toggle_logs.setChecked(visible)

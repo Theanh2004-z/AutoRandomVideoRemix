@@ -29,13 +29,15 @@ class RemixTitleBar(TitleBar):
         super().__init__(parent)
         self.setObjectName('dashboardHeader')
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setFixedHeight(64)
+        self.setFixedHeight(40)
         self.hBoxLayout.takeAt(0)  # Replace the library's leading stretch with app controls.
+        self.hBoxLayout.setContentsMargins(0, 0, 0, 0)
+        self.hBoxLayout.setSpacing(0)
         self.content = QWidget(self)
         self.content.setObjectName('titleBarContent')
         self.hBoxLayout.insertWidget(0, self.content, 1)
         for button, name in ((self.minBtn,'Thu nhỏ'),(self.maxBtn,'Phóng to / Khôi phục'),(self.closeBtn,'Đóng ứng dụng')):
-            button.setFixedSize(46,32)
+            button.setFixedSize(46, 40)
             button.setToolTip(name)
             button.setAccessibleName(name)
         self.maxBtn.clicked.disconnect()
@@ -48,7 +50,7 @@ class RemixTitleBar(TitleBar):
     def _isDragRegion(self, pos):
         child = self.childAt(pos)
         while child is not None and child is not self:
-            if isinstance(child,(QAbstractButton,QLineEdit,QAbstractSpinBox,QComboBox)):
+            if isinstance(child,(QAbstractButton,QLineEdit,QAbstractSpinBox,QComboBox)) or child.__class__.__name__ == 'SwitchButton':
                 return False
             child = child.parentWidget()
         return self.rect().contains(pos)

@@ -23,6 +23,7 @@ from core.settings_manager import settings
 class CutConfigPanel(CardWidget):
     """Area B: Segmentation & Randomisation Configuration."""
     config_changed = Signal()
+    fill_frame_changed = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,6 +140,21 @@ class CutConfigPanel(CardWidget):
         self.chk_trim_last.setChecked(bool(settings.get("trim_last_segment", True)))
         self.chk_trim_last.stateChanged.connect(self._update_summary)
         chk_layout.addWidget(self.chk_trim_last)
+
+        self.chk_fill_frame = QCheckBox(
+            "Tự động lấp đầy khung hình", self
+        )
+        self.chk_fill_frame.setChecked(settings.get("aspect_ratio_mode", "fit") == "crop")
+        self.chk_fill_frame.toggled.connect(self._on_fill_frame_toggled)
+        chk_layout.addWidget(self.chk_fill_frame)
+
+        self.lbl_fill_frame_desc = QLabel(
+            "Tự phóng và căn giữa từng video để phủ kín khung xuất. Phần hình dư ở các cạnh sẽ bị cắt.", self
+        )
+        self.lbl_fill_frame_desc.setWordWrap(True)
+        self.lbl_fill_frame_desc.setObjectName("mutedText")
+        self.lbl_fill_frame_desc.setStyleSheet("margin-left: 24px; margin-bottom: 4px; font-size: 11px;")
+        chk_layout.addWidget(self.lbl_fill_frame_desc)
 
         # Policy Controls Grid
         pol_grid = QGridLayout()
@@ -400,14 +416,10 @@ class CutConfigPanel(CardWidget):
         )
 
     def detach_advanced_settings(self):
-        """Move segmentation and policies into the dedicated settings dialog."""
+        """Move policies into the dedicated settings dialog."""
         self._guided_compact = True
         box = QWidget()
         layout = QVBoxLayout(box)
-        row = QHBoxLayout()
-        row.addWidget(self.segment_caption)
-        row.addWidget(self.spin_seg_dur, 1)
-        layout.addLayout(row)
         layout.addWidget(self.advanced_widget)
         self.advanced_widget.setVisible(True)
         self.btn_advanced.hide()
@@ -416,7 +428,21 @@ class CutConfigPanel(CardWidget):
         self._advanced_settings_box = box
         return box
 
+    def _on_fill_frame_toggled(self, checked: bool):
+        self.fill_frame_changed.emit(checked)
+
+    def set_fill_frame(self, checked: bool):
+        from PySide6.QtCore import QSignalBlocker
+        with QSignalBlocker(self.chk_fill_frame):
+            self.chk_fill_frame.setChecked(checked)
+
+    def set_exporting(self, is_exporting: bool):
+        self._exporting = is_exporting
+        self.chk_fill_frame.setEnabled(not is_exporting and not getattr(self, '_audio_only', False))
+
     def set_audio_only(self, audio_only: bool):
+        self._audio_only = audio_only
+        self.chk_fill_frame.setEnabled(not audio_only and not getattr(self, '_exporting', False))
         if getattr(self, '_guided_compact', False):
             self._advanced_settings_box.setEnabled(not audio_only)
             self.batch_caption.setText("Số lượng tệp:" if audio_only else "Số lượng video:")

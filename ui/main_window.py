@@ -17,7 +17,8 @@ import hashlib
 import subprocess
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QByteArray
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QScrollArea, QLabel, QMessageBox,
@@ -75,6 +76,7 @@ from ui.window_frame import RemixWindow
 from core.settings_manager import settings
 from core.render_cache import RenderCache
 from core.app_paths import get_cache_dir
+from core.update_manager import update_manager
 
 
 class MainWindow(RemixWindow):
@@ -86,6 +88,13 @@ class MainWindow(RemixWindow):
         self.resize(1320, 900)
         self.setMinimumSize(1100, 740)
         self.setStyleSheet(GLOBAL_STYLE_SHEET)
+
+        # ── Restore window position, size and state ────────────────────
+        self._restore_window_geometry()
+        self._save_geom_timer = QTimer(self)
+        self._save_geom_timer.setSingleShot(True)
+        self._save_geom_timer.setInterval(600)
+        self._save_geom_timer.timeout.connect(self.save_window_geometry)
 
         # ── Application state ──────────────────────────────────────────
         self.source_videos: List[VideoInfo] = []
@@ -113,6 +122,19 @@ class MainWindow(RemixWindow):
 
         # Schedule automatic restoration of source directories on startup
         QTimer.singleShot(250, self._auto_restore_sessions)
+        self._storage_worker = None
+        self._storage_timer = QTimer(self)
+        self._storage_timer.setInterval(30 * 60 * 1000)
+        self._storage_timer.timeout.connect(self._maintain_storage)
+        self._storage_timer.start()
+        QTimer.singleShot(1000, self._maintain_storage)
+
+        # Wire update manager export busy check
+        update_manager.set_export_busy_callback(self._is_export_busy)
+
+        # Schedule automatic background update check on startup (2.5s) if enabled
+        if settings.get("check_updates_on_startup", True):
+            QTimer.singleShot(2500, self._check_updates_startup)
 
     # ------------------------------------------------------------------
     # UI setup
@@ -130,6 +152,70 @@ class MainWindow(RemixWindow):
             setTheme(Theme.DARK if new_is_dark else Theme.LIGHT, save=False)
         settings.set("theme", "dark" if new_is_dark else "light")
         self.workflow.apply_theme(new_is_dark)
+
+    def _maintain_storage(self):
+        if self._closing_requested or self._storage_worker or not settings.get('auto_cleanup', True):
+            return
+        if (self.worker and self.worker.isRunning()) or self.workflow._running or self.workflow.settings_dialog.cache_busy:
+            return
+        from ui.background import StorageMaintenanceWorker
+        worker = StorageMaintenanceWorker(self)
+        self._storage_worker = worker
+        worker.result.connect(lambda result: self.progress_panel.log('INFO', f"Tự dọn lưu trữ: {result['workspaces']} thư mục tạm cũ."))
+        worker.failed.connect(lambda message: self.progress_panel.log('WARNING', 'Chưa dọn lưu trữ được: '+message))
+        worker.finished.connect(self._storage_maintenance_finished)
+        worker.start()
+
+    def _storage_maintenance_finished(self):
+        worker, self._storage_worker = self._storage_worker, None
+        if worker:
+            worker.deleteLater()
+
+    def _is_export_busy(self) -> bool:
+        return bool((self.worker and self.worker.isRunning()) or (hasattr(self, 'workflow') and self.workflow._running))
+
+    def _check_updates_startup(self):
+        if self._closing_requested or self._is_export_busy():
+            return
+
+        # Restore ownership before cleanup; pending packages survive a restart.
+        pending = update_manager.check_pending_update()
+        update_manager.cleanup_old_updates(keep_latest_backup=True)
+        if pending:
+            new_v = pending.get("new_version", "")
+            InfoBar.info(
+                title=f"Bản cập nhật v{new_v} đang chờ cài đặt",
+                content="Bản cập nhật đã được tải về trước đó. Mở Cài đặt ➔ Giới thiệu để khởi động lại và cài đặt.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=10000
+            )
+            return
+
+        # 3. Otherwise query GitHub for new release
+        update_manager.check_finished.connect(self._on_startup_update_check_finished)
+        update_manager.check_updates_async()
+
+    def _on_startup_update_check_finished(self, is_available: bool, info_or_err):
+        try:
+            update_manager.check_finished.disconnect(self._on_startup_update_check_finished)
+        except Exception:
+            pass
+        if not is_available or self._closing_requested:
+            return
+        if self._is_export_busy():
+            return
+
+        from core.update_service import ReleaseInfo
+        if isinstance(info_or_err, ReleaseInfo):
+            release_info = info_or_err
+            InfoBar.info(
+                title=f"Có bản cập nhật mới: v{release_info.version}",
+                content="Bản phát hành mới đã sẵn sàng. Mở Cài đặt ➔ Giới thiệu để cập nhật.",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=8000
+            )
 
     def _auto_restore_sessions(self):
         """Restores video and audio sources if previously configured folders exist."""
@@ -155,6 +241,9 @@ class MainWindow(RemixWindow):
         self.audio_panel.audios_scanned.connect(self._on_audios_scanned)
         self.audio_panel.config_changed.connect(self._on_audio_config_changed)
         self.cut_panel.config_changed.connect(self._on_cut_config_changed)
+        self.cut_panel.fill_frame_changed.connect(
+            lambda checked: self.output_panel.set_aspect_mode("crop" if checked else "fit")
+        )
 
         self.progress_panel.build_pool_requested.connect(self._on_build_pool)
         self.progress_panel.shuffle_pool_requested.connect(self._on_shuffle_pool)
@@ -221,6 +310,9 @@ class MainWindow(RemixWindow):
         self._plan_revision += 1
         target = self.audio_panel.get_export_target()
         self.output_panel.update_audio_mode_display(target)
+        out_cfg = self.output_panel.get_config()
+        has_audio = (out_cfg.audio_mode != "none") if target == "video_only" else True
+        self.progress_panel.set_export_mode(target, has_audio=has_audio)
         if target == "audio_only":
             self.progress_panel.btn_start.setText("BẮT ĐẦU XUẤT ÂM THANH ĐỘC LẬP")
         elif target == "video_only":
@@ -585,6 +677,8 @@ class MainWindow(RemixWindow):
         self.worker.video_started.connect(self._on_worker_video_started)
         self.worker.segment_progress.connect(self._on_worker_segment_progress)
         self.worker.overall_progress.connect(self._on_worker_overall_progress)
+        self.worker.video_progress.connect(self.progress_panel.update_video_progress)
+        self.worker.audio_progress.connect(self.progress_panel.update_audio_progress)
         self.worker.log_emitted.connect(self._on_worker_log)
         self.worker.video_completed.connect(self._on_worker_video_completed)
         self.worker.batch_finished.connect(self._on_worker_batch_finished)
@@ -606,7 +700,8 @@ class MainWindow(RemixWindow):
             self.render_cache = RenderCache(
                 cache_dir=settings.get('cache_folder','') or get_cache_dir(),
                 max_size_bytes=int(settings.get('cache_max_gb',5))*1024**3,
-                enabled=bool(settings.get('cache_enabled',True)))
+                enabled=bool(settings.get('cache_enabled',True)),
+                min_free_bytes=int(settings.get('storage_min_free_gb',2))*1024**3)
             export_target = self.audio_panel.get_export_target()
             out_cfg = self.output_panel.get_config()
             out_cfg.export_target = export_target
@@ -695,16 +790,21 @@ class MainWindow(RemixWindow):
             # PRE-FLIGHT: DISK SPACE ESTIMATION
             # -------------------------------------------------------------
             from core.disk_estimator import DiskEstimator
+            from core.app_paths import get_scratch_dir
             tot_dur = cut_cfg.target_total_duration * cut_cfg.batch_count
             w, h = out_cfg.width_height
             is_audio = (export_target == "audio_only")
-            req_bytes = DiskEstimator.estimate_required_bytes(
-                total_duration_sec=tot_dur,
+            scratch_dir = get_scratch_dir()
+
+            disk_check = DiskEstimator.check_dual_storage(
+                output_dir=out_cfg.output_dir,
+                scratch_dir=scratch_dir,
+                single_video_duration_sec=cut_cfg.target_total_duration,
+                batch_count=cut_cfg.batch_count,
                 width=w,
                 height=h,
                 is_audio_only=is_audio
             )
-            disk_check = DiskEstimator.check_disk_space(out_cfg.output_dir, req_bytes)
             if not disk_check.is_sufficient:
                 self.progress_panel.log("WARNING", disk_check.message)
                 reply = QMessageBox.warning(
@@ -718,7 +818,7 @@ class MainWindow(RemixWindow):
                     self.progress_panel.set_running_state(False)
                     return
             else:
-                self.progress_panel.log("INFO", f"💾 Kiểm tra ổ đĩa: Cần ~{disk_check.formatted_required}, trống {disk_check.formatted_available}.")
+                self.progress_panel.log("INFO", f"💾 Kiểm tra ổ đĩa: {disk_check.message}")
 
             # -------------------------------------------------------------
             # CASE 1: STANDALONE AUDIO EXPORT
@@ -740,6 +840,7 @@ class MainWindow(RemixWindow):
                     output_config=out_cfg,
                     audio_playlists=playlists,
                     record_history=False,
+                    scratch_dir=scratch_dir,
                     parent=self
                 )
                 self._connect_worker_signals()
@@ -815,6 +916,8 @@ class MainWindow(RemixWindow):
             else:
                 out_cfg.audio_mode = self.output_panel.get_config().audio_mode
 
+            has_audio = (out_cfg.audio_mode != "none") if export_target == "video_only" else True
+            self.progress_panel.set_export_mode(export_target, has_audio=has_audio)
             self.progress_panel.set_running_state(True)
             self.worker = VideoProcessorWorker(
                 batch_plans=plans,
@@ -822,6 +925,7 @@ class MainWindow(RemixWindow):
                 audio_playlists=audio_playlists_to_send,
                 record_history=cut_cfg.use_export_history,
                 render_cache=getattr(self, "render_cache", None),
+                scratch_dir=scratch_dir,
                 job_id=job_id,
                 history_repo=history_repo,
                 source_metadata={video.path:video for video in self.source_videos},
@@ -854,6 +958,12 @@ class MainWindow(RemixWindow):
             self.worker.resume()
 
     def _on_cancel_rendering(self):
+        if hasattr(self, "workflow"):
+            self.workflow._cancelling = True
+            if hasattr(self.workflow, "_update_dialog_close_state"):
+                self.workflow._update_dialog_close_state()
+            if hasattr(self.workflow, "refresh"):
+                self.workflow.refresh()
         if self.worker:
             self.worker.cancel()
 
@@ -870,6 +980,7 @@ class MainWindow(RemixWindow):
             len(self.current_batch_plans[cur_idx - 1])
             if cur_idx <= len(self.current_batch_plans) else 0
         )
+        self.progress_panel.reset_bars()
         self.progress_panel.update_stats(cur_idx, total_idx, 0, total_segs)
 
     def _on_worker_segment_progress(self, cur_seg: int, total_segs: int, seg: SegmentInfo):
@@ -894,7 +1005,32 @@ class MainWindow(RemixWindow):
         self.progress_panel.set_running_state(False)
         out_cfg = self.output_panel.get_config()
 
-        if success_cnt == total_cnt and total_cnt > 0:
+        was_cancelled = (
+            (hasattr(self, "workflow") and (
+                getattr(self.workflow, "_cancelling", False) or
+                getattr(self.workflow, "_result_state", "") == "Đã hủy"
+            )) or
+            (hasattr(self, "worker") and bool(
+                self.worker and (
+                    getattr(self.worker, "_cancel_requested", False) or
+                    (getattr(self.worker, "engine", None) and getattr(self.worker.engine, "_is_cancelled", False)) or
+                    (getattr(self.worker, "audio_engine", None) and getattr(self.worker.audio_engine, "_is_cancelled", False))
+                )
+            ))
+        )
+        if was_cancelled:
+            self.progress_panel.log(
+                "WARNING",
+                f"Tiến trình xuất đã được hủy ({success_cnt}/{total_cnt} video đã tạo)."
+            )
+            InfoBar.warning(
+                title="Đã hủy xuất",
+                content=f"Tiến trình đã dừng ({success_cnt}/{total_cnt} video thành công).",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=4000,
+            )
+        elif success_cnt == total_cnt and total_cnt > 0:
             self.progress_panel.log(
                 "SUCCESS",
                 f"🎉 HOÀN TẤT! Đã xuất thành công {success_cnt}/{total_cnt} video."
@@ -919,6 +1055,22 @@ class MainWindow(RemixWindow):
             )
 
     def _on_worker_error(self, err_msg: str):
+        was_cancelled = (
+            (hasattr(self, "workflow") and (
+                getattr(self.workflow, "_cancelling", False) or
+                getattr(self.workflow, "_result_state", "") == "Đã hủy"
+            )) or
+            (hasattr(self, "worker") and bool(
+                self.worker and (
+                    getattr(self.worker, "_cancel_requested", False) or
+                    (getattr(self.worker, "engine", None) and getattr(self.worker.engine, "_is_cancelled", False)) or
+                    (getattr(self.worker, "audio_engine", None) and getattr(self.worker.audio_engine, "_is_cancelled", False))
+                )
+            ))
+        )
+        if was_cancelled:
+            self.progress_panel.log("WARNING", f"Đã dừng tác vụ: {err_msg}")
+            return
         self.progress_panel.log("ERROR", err_msg)
         InfoBar.error(
             title="Lỗi xử lý",
@@ -931,7 +1083,79 @@ class MainWindow(RemixWindow):
     # Window events
     # ------------------------------------------------------------------
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_save_geom_timer'):
+            self._save_geom_timer.start()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, '_save_geom_timer'):
+            self._save_geom_timer.start()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, '_save_geom_timer'):
+            self._save_geom_timer.start()
+
+    def save_window_geometry(self):
+        try:
+            is_max = self.isMaximized()
+            geom = self.saveGeometry()
+            geom_data = {
+                "window_maximized": is_max,
+                "window_geometry": bytes(geom).hex() if geom else "",
+            }
+            if not is_max:
+                pos = self.pos()
+                size = self.size()
+                if size.width() >= 600 and size.height() >= 400:
+                    geom_data["window_x"] = pos.x()
+                    geom_data["window_y"] = pos.y()
+                    geom_data["window_width"] = size.width()
+                    geom_data["window_height"] = size.height()
+            settings.update(geom_data, auto_save=False)
+            if settings.get("auto_save", True):
+                settings.save()
+        except Exception:
+            pass
+
+    def _restore_window_geometry(self):
+        try:
+            geom_hex = settings.get("window_geometry", "")
+            if geom_hex:
+                qbyte = QByteArray.fromHex(geom_hex.encode("utf-8"))
+                if not qbyte.isEmpty():
+                    self.restoreGeometry(qbyte)
+
+            w = settings.get("window_width")
+            h = settings.get("window_height")
+            x = settings.get("window_x")
+            y = settings.get("window_y")
+            if w and h:
+                self.resize(int(w), int(h))
+            if x is not None and y is not None:
+                self.move(int(x), int(y))
+
+            # Multi-screen safeguard: ensure window is visible on at least one screen
+            screens = QGuiApplication.screens()
+            if screens:
+                frame_rect = self.frameGeometry()
+                if not any(s.geometry().intersects(frame_rect) for s in screens):
+                    primary = QGuiApplication.primaryScreen() or screens[0]
+                    avail = primary.availableGeometry()
+                    self.move(
+                        avail.x() + max(0, (avail.width() - self.width()) // 2),
+                        avail.y() + max(0, (avail.height() - self.height()) // 2)
+                    )
+
+            if settings.get("window_maximized", False):
+                self.showMaximized()
+        except Exception:
+            pass
+
     def closeEvent(self, event):
+        self.save_window_geometry()
         rendering = bool(self.worker and self.worker.isRunning())
         if rendering and not self._closing_requested:
             reply = QMessageBox.question(self,"Đóng ứng dụng",
@@ -942,9 +1166,12 @@ class MainWindow(RemixWindow):
                 return
         self._closing_requested = True
         self.workflow.stop_background()
+        self._storage_timer.stop()
+        if self._storage_worker:
+            self._storage_worker.requestInterruption()
         if rendering:
             self.worker.cancel()
-        if rendering or self.workflow.background_running():
+        if rendering or self.workflow.background_running() or (self._storage_worker and self._storage_worker.isRunning()):
             event.ignore()
             self.workflow.state_label.setText("Đang dừng tác vụ…")
             QTimer.singleShot(100,self.close)

@@ -4,9 +4,11 @@ Handles trimming, resolution & FPS normalization, aspect ratio fitting/cropping,
 audio stripping / keeping / background music injection, seamless concatenation,
 probe validation, and pause/cancel handling.
 """
+from core.storage_cleanup import Workspace, SpaceGuard, stop_owned_process
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from typing import List, Dict, Optional, Callable, Tuple, Any
@@ -17,6 +19,7 @@ from core.audio_processor import AudioProcessorEngine
 from core.filename_generator import get_next_output_path
 from core.output_validator import OutputValidator
 from core.output_commit import OutputCommit
+from core.app_paths import get_scratch_dir
 
 from PySide6.QtCore import QThread, Signal
 
@@ -35,12 +38,18 @@ class VideoProcessorEngine:
         on_segment_done: Optional[Callable[[int, int, SegmentInfo], None]] = None,
         on_progress: Optional[Callable[[float, str], None]] = None,
         render_cache: Optional[Any] = None,
-        source_metadata: Optional[Dict[str, VideoInfo]] = None
+        source_metadata: Optional[Dict[str, VideoInfo]] = None,
+        on_video_progress: Optional[Callable[[float], None]] = None,
+        on_audio_progress: Optional[Callable[[float], None]] = None,
+        scratch_dir: Optional[str] = None
     ):
         self.config = output_config
+        self.scratch_dir = scratch_dir
         self.on_log = on_log or (lambda lvl, msg: None)
         self.on_segment_done = on_segment_done or (lambda idx, total, seg: None)
         self.on_progress = on_progress or (lambda pct, msg: None)
+        self.on_video_progress = on_video_progress or (lambda pct: None)
+        self.on_audio_progress = on_audio_progress or (lambda pct: None)
         self.render_cache = render_cache
         if self.render_cache is None:
             try:
@@ -53,7 +62,9 @@ class VideoProcessorEngine:
         self._is_cancelled = False
         self._current_subprocess: Optional[subprocess.Popen] = None
         self._temp_dir: Optional[str] = None
+        self._workspace = None
         self._segment_renderer = None
+        self._audio_engine = None
         self.source_metadata = dict(source_metadata or {})
         self.disabled_gpu_pipelines = set()
         self.batch_render_disabled = False
@@ -70,6 +81,8 @@ class VideoProcessorEngine:
     def cancel(self):
         self._is_cancelled = True
         self.on_log("WARNING", "Đang hủy tiến trình...")
+        if self._audio_engine:
+            self._audio_engine.cancel()
         if self._segment_renderer:
             self._segment_renderer.cancel()
         if self._current_subprocess:
@@ -84,11 +97,12 @@ class VideoProcessorEngine:
         # Active tasks are joined before the render path removes its workspace.
 
     def _cleanup_temp_dir(self):
-        if self._temp_dir and os.path.isdir(self._temp_dir):
+        if self._workspace:
             try:
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            except Exception as e:
-                self.on_log("WARNING", f"Không thể xóa thư mục tạm: {e}")
+                self._workspace.cleanup()
+                self._workspace = None
+            except OSError as error:
+                self.on_log("WARNING", f"Chưa dọn hết tệp tạm; sẽ thử lại sau: {error}")
 
     def _build_filter_complex(self, target_w: int, target_h: int) -> str:
         """
@@ -146,7 +160,30 @@ class VideoProcessorEngine:
 
         return target_encoder, encoder_options(self.config,target_encoder)
 
-    def process_video_plan(
+    def process_video_plan(self, plan, output_file_path, video_index, total_videos, audio_playlist=None):
+        scratch = self.scratch_dir or get_scratch_dir()
+        os.makedirs(scratch, exist_ok=True)
+        output = os.path.dirname(os.path.abspath(output_file_path))
+        os.makedirs(output, exist_ok=True)
+        guard = SpaceGuard([scratch, output], self)
+        self._staging_path = None
+        try:
+            if not guard.start():
+                return False
+            return self._process_video_plan(plan, output_file_path, video_index, total_videos, audio_playlist)
+        finally:
+            guard.close()
+            if stop_owned_process(self):
+                self._current_subprocess = None
+                self._audio_engine = None
+                self._cleanup_temp_dir()
+                if self.render_cache and hasattr(self.render_cache, 'flush'):
+                    try:
+                        self.render_cache.flush()
+                    except OSError:
+                        pass
+
+    def _process_video_plan(
         self,
         plan: List[SegmentInfo],
         output_file_path: str,
@@ -168,13 +205,12 @@ class VideoProcessorEngine:
 
         os.makedirs(os.path.dirname(os.path.abspath(output_file_path)), exist_ok=True)
 
-        # Create unique temporary workspace
+        # Create unique temporary workspace in scratch_dir (SSD)
         temp_id = uuid.uuid4().hex[:8]
-        self._temp_dir = os.path.join(
-            os.path.dirname(os.path.abspath(output_file_path)),
-            f"_temp_remix_{temp_id}"
-        )
-        os.makedirs(self._temp_dir, exist_ok=True)
+        scratch_base = self.scratch_dir or get_scratch_dir()
+        os.makedirs(scratch_base, exist_ok=True)
+        self._workspace = Workspace(scratch_base, "remix")
+        self._temp_dir = str(self._workspace.path)
 
         target_w, target_h = self.config.width_height
         target_fps = self.config.fps
@@ -182,6 +218,9 @@ class VideoProcessorEngine:
 
         total_segments = len(plan)
         temp_segment_files: List[str] = []
+
+        self.on_video_progress(0.0)
+        self.on_audio_progress(0.0)
 
         self.on_log("INFO", f"=== Bắt đầu tạo video #{video_index}/{total_videos}: {os.path.basename(output_file_path)} ===")
         self.on_log("INFO", f"Tổng số đoạn cắt: {total_segments} đoạn | Độ phân giải: {target_w}x{target_h} | FPS: {target_fps}")
@@ -199,27 +238,57 @@ class VideoProcessorEngine:
                 break
             except HardwareEncoderError as error:
                 if self._is_cancelled:
-                    self._cleanup_temp_dir()
                     return False
                 self.on_log('WARNING',f'Bộ mã hóa GPU không hoàn thành tác vụ. Đang làm lại lượt này bằng CPU để giữ cấu hình đồng nhất. {str(error)[-240:]}')
                 encoder_name,encoder_opts = self._determine_encoder(force_cpu=True)
                 for clip in plan: clip.status='Chờ xử lý'
             except RenderCancelled:
-                self._cleanup_temp_dir()
                 return False
             except Exception as error:
                 self.on_log('ERROR',f'Lỗi xử lý đoạn video: {error}')
-                self._cleanup_temp_dir()
                 return False
             finally:
                 self._segment_renderer = None
         else:
-            self._cleanup_temp_dir()
             return False
 
-        # Step 7: Concatenate all segments seamlessly
-        self.on_progress(88.0, f"Video #{video_index}/{total_videos}: Đang ghép nối các đoạn video...")
-        self.on_log("INFO", "Ghép nối tất cả các đoạn video thành file hoàn chỉnh...")
+        # Step 7: Prepare Audio if configured (Random Audio Pool)
+        temp_audio_file = None
+        if self.config.audio_mode == "random_audio_pool":
+            if not audio_playlist:
+                self.on_log("ERROR", "Lỗi: Danh sách phát âm thanh ngẫu nhiên rỗng, không thể ghép.")
+                return False
+            self.on_audio_progress(0.0)
+            self.on_progress(88.0, f"Video #{video_index}/{total_videos}: Đang chuẩn bị {len(audio_playlist)} bài âm thanh...")
+            self.on_log("INFO", f"Chuẩn bị {len(audio_playlist)} bài âm thanh ngẫu nhiên từ Phần 2...")
+            temp_audio_file = os.path.join(self._temp_dir, "temp_audio.wav")
+            audio_engine = AudioProcessorEngine(
+                on_log=self.on_log,
+                on_progress=lambda p, m: (
+                    self.on_progress(round(88.0 + p * 0.04, 1), m),
+                    self.on_audio_progress(p)
+                ),
+                scratch_dir=self.scratch_dir
+            )
+            self._audio_engine = audio_engine
+            if self._is_cancelled:
+                audio_engine.cancel()
+            audio_ok = audio_engine.process_audio_playlist(
+                playlist=audio_playlist,
+                output_file_path=temp_audio_file,
+                output_format="wav"
+            )
+            self._audio_engine = None
+            if self._is_cancelled or not (audio_ok and os.path.isfile(temp_audio_file)):
+                self.on_log("ERROR", "Không thể chuẩn bị file âm thanh ngẫu nhiên từ kho nhạc.")
+                return False
+            self.on_audio_progress(100.0)
+
+        # Step 8: Single-Pass Concat + Audio Muxing directly to destination staging file
+        self.on_video_progress(0.0)
+        expected_dur = sum(c.effective_duration for c in plan)
+        self.on_progress(92.0, f"Video #{video_index}/{total_videos}: Đang ghép nối video và âm thanh...")
+        self.on_log("INFO", "Ghép nối tất cả các đoạn video và âm thanh trong 1 lượt ghi duy nhất...")
 
         concat_list_file = os.path.join(self._temp_dir, "concat_list.txt")
         with open(concat_list_file, "w", encoding="utf-8") as f:
@@ -227,139 +296,158 @@ class VideoProcessorEngine:
                 safe_path = seg.replace("\\", "/").replace("'", "'\\''")
                 f.write(f"file '{safe_path}'\n")
 
-        merged_intermediate = os.path.join(self._temp_dir, "merged_raw.mp4")
+        final_staging_path = OutputCommit.get_staging_path(output_file_path)
+        self._workspace.track_staging(final_staging_path)
+
+        # Build single-pass FFmpeg command
         concat_cmd = [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
-            "-i", concat_list_file,
-            "-c", "copy",
-            merged_intermediate
+            "-i", concat_list_file
         ]
 
-        try:
-            self._current_subprocess = subprocess.Popen(
-                concat_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            _, stderr = self._current_subprocess.communicate()
-
-            if self._is_cancelled:
-                self._cleanup_temp_dir()
-                return False
-
-            if self._current_subprocess.returncode != 0:
-                err_text = stderr.decode("utf-8", errors="replace") if stderr else "Unknown error"
-                tail_err = "\n".join(err_text.strip().splitlines()[-5:])
-                self.on_log("ERROR", f"Lỗi ghép concat video: {tail_err}")
-                self._cleanup_temp_dir()
-                return False
-
-        except Exception as e:
-            self.on_log("ERROR", f"Ngoại lệ khi ghép concat: {e}")
-            self._cleanup_temp_dir()
-            return False
-
-        # Step 8: Audio Handling & Muxing (Random Audio Pool / BGM / None)
-        final_temp_path = os.path.join(self._temp_dir, "final_ready.mp4")
-
-        if self.config.audio_mode == "random_audio_pool" and audio_playlist:
-            self.on_progress(92.0, f"Video #{video_index}/{total_videos}: Đang ghép {len(audio_playlist)} bài âm thanh ngẫu nhiên...")
-            self.on_log("INFO", f"Ghép {len(audio_playlist)} bài âm thanh ngẫu nhiên từ Phần 2 vào video...")
-            temp_audio_file = os.path.join(self._temp_dir, "temp_audio.wav")
-            audio_engine = AudioProcessorEngine(
-                on_log=self.on_log,
-                on_progress=lambda p, m: self.on_progress(round(88.0 + p * 0.08, 1), m)
-            )
-            audio_ok = audio_engine.process_audio_playlist(
-                playlist=audio_playlist,
-                output_file_path=temp_audio_file,
-                output_format="wav"
-            )
-            if audio_ok and os.path.isfile(temp_audio_file):
-                self.on_log("INFO", "Mux âm thanh ngẫu nhiên vào file video MP4...")
-                mux_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", merged_intermediate,
-                    "-i", temp_audio_file,
-                    "-map", "0:v:0",
-                    "-map", "1:a:0",
-                    "-c:v", "copy",
-                    "-c:a", "aac", "-b:a", "192k",
-                    final_temp_path
-                ]
-                try:
-                    self._current_subprocess = subprocess.Popen(
-                        mux_cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                    )
-                    _, stderr = self._current_subprocess.communicate()
-                    if self._current_subprocess.returncode != 0:
-                        err_text = stderr.decode("utf-8", errors="replace") if stderr else "Unknown error"
-                        self.on_log("ERROR", f"Lỗi mux âm thanh vào video: {err_text[:300]}")
-                        self._cleanup_temp_dir()
-                        return False
-                except Exception as e:
-                    self.on_log("ERROR", f"Ngoại lệ khi mux âm thanh vào video: {e}")
-                    self._cleanup_temp_dir()
-                    return False
-            else:
-                self.on_log("ERROR", "Không thể chuẩn bị file âm thanh ngẫu nhiên từ kho nhạc.")
-                self._cleanup_temp_dir()
-                return False
-
-        elif self.config.audio_mode == "random_audio_pool" and not audio_playlist:
-            self.on_log("ERROR", "Lỗi: Danh sách phát âm thanh ngẫu nhiên rỗng, không thể ghép.")
-            self._cleanup_temp_dir()
-            return False
-
+        if self.config.audio_mode == "random_audio_pool" and temp_audio_file:
+            concat_cmd.extend([
+                "-i", temp_audio_file,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k"
+            ])
         elif self.config.audio_mode == "bgm" and os.path.isfile(self.config.bgm_path):
-            self.on_progress(95.0, f"Video #{video_index}/{total_videos}: Đang chèn nhạc nền...")
             self.on_log("INFO", f"Chèn nhạc nền: {os.path.basename(self.config.bgm_path)}...")
-            bgm_cmd = [
-                "ffmpeg", "-y",
-                "-i", merged_intermediate,
+            concat_cmd.extend([
                 "-stream_loop", "-1",
                 "-i", self.config.bgm_path,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                final_temp_path
-            ]
-            try:
-                self._current_subprocess = subprocess.Popen(
-                    bgm_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                )
-                _, stderr = self._current_subprocess.communicate()
-                if self._current_subprocess.returncode != 0:
-                    err_text = stderr.decode("utf-8", errors="replace") if stderr else "Unknown error"
-                    self.on_log("ERROR", f"Lỗi chèn nhạc nền: {err_text[:300]}")
-                    self._cleanup_temp_dir()
-                    return False
-            except Exception as e:
-                self.on_log("ERROR", f"Ngoại lệ khi chèn nhạc nền: {e}")
-                self._cleanup_temp_dir()
-                return False
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest"
+            ])
+        elif self.config.audio_mode == "keep":
+            concat_cmd.extend([
+                "-c", "copy"
+            ])
         else:
-            shutil.move(merged_intermediate, final_temp_path)
+            concat_cmd.extend([
+                "-map", "0:v:0",
+                "-c:v", "copy",
+                "-an"
+            ])
+
+        concat_cmd.extend([
+            "-progress", "pipe:1",
+            "-stats_period", "0.5",
+            final_staging_path
+        ])
+
+        try:
+            self._current_subprocess = subprocess.Popen(
+                concat_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            sub = self._current_subprocess
+            stderr_lines: List[str] = []
+
+            def _drain_stderr():
+                if not sub or not hasattr(sub, "stderr") or sub.stderr is None:
+                    return
+                try:
+                    for line_bytes in iter(sub.stderr.readline, b''):
+                        stderr_lines.append(line_bytes.decode('utf-8', errors='replace'))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        sub.stderr.close()
+                    except Exception:
+                        pass
+
+            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stderr_thread.start()
+
+            start_concat_time = time.monotonic()
+            if sub and hasattr(sub, "stdout") and sub.stdout is not None and hasattr(sub.stdout, "readline"):
+                try:
+                    for raw_line in iter(sub.stdout.readline, b''):
+                        if self._is_cancelled:
+                            break
+                        while self._is_paused and not self._is_cancelled:
+                            time.sleep(0.3)
+
+                        line = raw_line.decode('utf-8', errors='replace').strip()
+                        if '=' in line:
+                            k, _, v = line.partition('=')
+                            k = k.strip()
+                            v = v.strip()
+                            cur_sec = None
+                            if k == 'out_time_us' and v.isdigit():
+                                cur_sec = int(v) / 1_000_000.0
+                            elif k == 'out_time' and ':' in v:
+                                try:
+                                    parts = v.split(':')
+                                    if len(parts) == 3:
+                                        cur_sec = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                                except Exception:
+                                    pass
+
+                            if cur_sec is not None and expected_dur > 0:
+                                fraction = min(1.0, max(0.0, cur_sec / expected_dur))
+                                concat_pct = round(92.0 + fraction * 5.5, 1)  # 92.0% -> 97.5%
+                                elapsed = int(time.monotonic() - start_concat_time)
+                                m_cur, s_cur = divmod(int(cur_sec), 60)
+                                m_tot, s_tot = divmod(int(expected_dur), 60)
+                                time_str = f"{m_cur:02d}:{s_cur:02d}/{m_tot:02d}:{s_tot:02d}"
+                                self.on_progress(
+                                    concat_pct,
+                                    f"Video #{video_index}/{total_videos}: Đang ghép kết quả · {time_str} (đã ghép {elapsed}s)"
+                                )
+                                self.on_video_progress(round(fraction * 100.0, 1))
+                finally:
+                    try:
+                        sub.stdout.close()
+                    except Exception:
+                        pass
+
+            if sub:
+                if hasattr(sub, "wait"):
+                    sub.wait()
+                elif hasattr(sub, "communicate"):
+                    sub.communicate()
+            stderr_thread.join(timeout=2.0)
+
+            if self._is_cancelled:
+                OutputCommit.discard_staging(final_staging_path)
+                return False
+
+            returncode = getattr(sub, "returncode", 0) if sub else 0
+            if returncode != 0:
+                err_text = "".join(stderr_lines).strip()
+                tail_err = "\n".join(err_text.splitlines()[-5:]) if err_text else "Unknown error"
+                self.on_log("ERROR", f"Lỗi ghép video và âm thanh: {tail_err}")
+                OutputCommit.discard_staging(final_staging_path)
+                return False
+
+        except Exception as e:
+            self.on_log("ERROR", f"Ngoại lệ khi ghép kết quả: {e}")
+            OutputCommit.discard_staging(final_staging_path)
+            return False
 
         # Step 9: Probe Validation & Atomic 2-Phase Publication (V3)
+        self.on_video_progress(100.0)
         self.on_progress(98.0, f"Video #{video_index}/{total_videos}: Đang kiểm tra file xuất...")
         self.on_log("INFO", "Kiểm tra tính toàn vẹn của video đầu ra bằng OutputValidator...")
 
-        expected_dur = sum(c.effective_duration for c in plan)
         target_fps = float(self.config.fps)
         val_result = OutputValidator.validate_video(
-            file_path=final_temp_path,
+            file_path=final_staging_path,
             expected_duration=expected_dur,
             expected_width=target_w,
             expected_height=target_h,
@@ -370,20 +458,18 @@ class VideoProcessorEngine:
 
         if not val_result.is_valid:
             self.on_log("ERROR", f"Kiểm tra chất lượng thất bại: {val_result.error_msg}")
-            OutputCommit.discard_staging(final_temp_path)
-            self._cleanup_temp_dir()
+            OutputCommit.discard_staging(final_staging_path)
             return False
 
         # Step 10: Atomic publication via OutputCommit (prevents overwrite)
         ok, commit_msg = OutputCommit.publish_file(
-            staging_path=final_temp_path,
+            staging_path=final_staging_path,
             final_destination_path=output_file_path,
             validation=val_result,
             allow_overwrite=False
         )
         if not ok:
             self.on_log("ERROR", commit_msg)
-            self._cleanup_temp_dir()
             return False
 
         dur_diff = abs((val_result.actual_duration or 0.0) - expected_dur)
@@ -395,8 +481,17 @@ class VideoProcessorEngine:
             f"FPS: {val_result.actual_fps:.1f} | Sai lệch: {dur_diff:.2f}s"
         )
 
+        # Flush cache size limit after batch completion
+        if self.render_cache and hasattr(self.render_cache, 'flush'):
+            try:
+                self.render_cache.flush()
+            except Exception:
+                pass
+
         # Step 11: Clean up temp
-        self._cleanup_temp_dir()
+        self.on_video_progress(100.0)
+        if self.config.audio_mode in ("random_audio_pool", "bgm"):
+            self.on_audio_progress(100.0)
         self.on_progress(100.0, f"Hoàn tất video #{video_index}/{total_videos}!")
         return True
 
@@ -410,6 +505,8 @@ class VideoProcessorWorker(QThread):
     video_started = Signal(int, int, str)  # cur_idx, total_idx, output_path
     segment_progress = Signal(int, int, object)  # cur_seg, total_seg, ClipSegment
     overall_progress = Signal(float, str)  # percent, status message
+    video_progress = Signal(float)  # percent (0.0 - 100.0)
+    audio_progress = Signal(float)  # percent (0.0 - 100.0)
     log_emitted = Signal(str, str)  # level, message
     video_completed = Signal(int, str)  # video_idx, output_path
     batch_finished = Signal(int, int)  # success_count, total_count
@@ -426,7 +523,8 @@ class VideoProcessorWorker(QThread):
         history_repo: Optional[Any] = None,
         parent=None,
         *,
-        source_metadata: Optional[Dict[str, VideoInfo]] = None
+        source_metadata: Optional[Dict[str, VideoInfo]] = None,
+        scratch_dir: Optional[str] = None
     ):
         super().__init__(parent)
         self.batch_plans = batch_plans
@@ -437,6 +535,7 @@ class VideoProcessorWorker(QThread):
         self.job_id = job_id
         self.history_repo = history_repo
         self.source_metadata = dict(source_metadata or {})
+        self.scratch_dir = scratch_dir
         self._cancel_requested = False
         self.engine: Optional[VideoProcessorEngine] = None
         self.audio_engine: Optional[AudioProcessorEngine] = None
@@ -479,7 +578,11 @@ class VideoProcessorWorker(QThread):
 
             self.audio_engine = AudioProcessorEngine(
                 on_log=lambda lvl, msg: self.log_emitted.emit(lvl, msg),
-                on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg)
+                on_progress=lambda pct, msg: (
+                    self.overall_progress.emit(pct, msg),
+                    self.audio_progress.emit(pct)
+                ),
+                scratch_dir=self.scratch_dir
             )
             if self._cancel_requested:
                 self.audio_engine.cancel()
@@ -496,6 +599,8 @@ class VideoProcessorWorker(QThread):
                     reserved_paths=reserved_paths
                 )
                 self.video_started.emit(audio_num, total_audios, out_path)
+                self.video_progress.emit(0.0)
+                self.audio_progress.emit(0.0)
 
                 ok = self.audio_engine.process_audio_playlist(
                     playlist=playlist,
@@ -503,6 +608,7 @@ class VideoProcessorWorker(QThread):
                     output_format=fmt
                 )
                 if ok:
+                    self.audio_progress.emit(100.0)
                     success_count += 1
                     self.video_completed.emit(audio_num, out_path)
                 else:
@@ -526,7 +632,10 @@ class VideoProcessorWorker(QThread):
             on_segment_done=lambda idx, tot, seg: self.segment_progress.emit(idx, tot, seg),
             on_progress=lambda pct, msg: self.overall_progress.emit(pct, msg),
             render_cache=self.render_cache,
-            source_metadata=self.source_metadata
+            source_metadata=self.source_metadata,
+            on_video_progress=lambda pct: self.video_progress.emit(pct),
+            on_audio_progress=lambda pct: self.audio_progress.emit(pct),
+            scratch_dir=self.scratch_dir
         )
         if self._cancel_requested:
             self.engine.cancel()
@@ -544,6 +653,8 @@ class VideoProcessorWorker(QThread):
                     reserved_paths=reserved_paths
                 )
                 self.video_started.emit(video_idx, total_videos, out_path)
+                self.video_progress.emit(0.0)
+                self.audio_progress.emit(0.0)
 
                 audio_pl = self.audio_playlists[v_i] if v_i < len(self.audio_playlists) else (
                     self.audio_playlists[0] if self.audio_playlists else None
@@ -558,6 +669,9 @@ class VideoProcessorWorker(QThread):
                 )
 
                 if ok:
+                    self.video_progress.emit(100.0)
+                    if audio_pl or self.output_config.audio_mode == "bgm":
+                        self.audio_progress.emit(100.0)
                     success_count += 1
                     # Commit history to SQLite and remove this plan's reservations (V02)
                     if self.history_repo and self.job_id:

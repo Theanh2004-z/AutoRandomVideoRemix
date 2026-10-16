@@ -55,11 +55,13 @@ class GuidedWorkflow(QWidget):
         self._failed_signature = None
         self._background_message = ""
         self._running = False
+        self._cancelling = False
         self._preparing = False
         self._validated_signature = None
         self._last_signature = None
         self._pool_config = None
         self._finished = False
+        self._has_run_completed = False
         self._checks_key = None
         self._last_output = ""
         self._plan_error = ""
@@ -429,9 +431,22 @@ class GuidedWorkflow(QWidget):
             self.plan_notice.setText(self._plan_error)
         elif prepared:
             self.plan_notice.setText("Kế hoạch đã sẵn sàng. Nội dung bên dưới sẽ được dùng khi xuất; thay đổi cấu hình sẽ yêu cầu kiểm tra lại.")
+        elif getattr(self, '_cancelling', False):
+            self.plan_notice.setText("Tiến trình đang được hủy…")
+        elif self._result_state == "Đã hủy":
+            self.plan_notice.setText("Tiến trình trước đã bị hủy. Bấm Xuất hoặc Lượt mới để tạo kế hoạch mới.")
+        elif self._result_state == "Xuất thất bại":
+            self.plan_notice.setText("Lượt xuất trước gặp lỗi. Bấm Xuất hoặc Lượt mới để tạo kế hoạch mới.")
+        elif self._finished or self._result_state == "Đã hoàn tất":
+            self.plan_notice.setText("Lượt xuất trước đã hoàn tất. Bấm Xuất hoặc Lượt mới để tạo kế hoạch mới.")
         elif self.host._plan_is_stale:
             self.plan_notice.setText("Kế hoạch sẽ tự chuẩn bị khi nguồn và cấu hình đã đủ.")
-        self.state_label.setText("Đang xuất" if self._running else "Đang chuẩn bị ngầm" if self._preparing else
+        else:
+            self.plan_notice.setText("Kế hoạch chưa sẵn sàng. Kiểm tra nguồn và thiết lập trước khi xuất.")
+
+        self.state_label.setText("Đang hủy…" if getattr(self, '_cancelling', False) else
+                                 "Đang xuất" if self._running else
+                                 "Đang chuẩn bị ngầm" if self._preparing else
                                  "Đang kiểm tra nguồn" if value.scanning_video or value.scanning_audio else
                                  self._result_state or ("Sẵn sàng xuất" if prepared else "Đang thiết lập"))
         self.settings_button.setEnabled(not self._running)
@@ -601,6 +616,7 @@ class GuidedWorkflow(QWidget):
 
     def running_changed(self, running):
         self._running = running
+        self.host.cut_panel.set_exporting(running)
         if running:
             self._finished = False
             self._result_state = ""
@@ -618,17 +634,43 @@ class GuidedWorkflow(QWidget):
 
     def finished(self, success_count, total_count):
         self._running = False
-        self._finished = success_count == total_count and total_count > 0
-        if self._finished:
-            self._result_state = "Đã hoàn tất"
-            self.result_label.setText(f"Đã hoàn tất {success_count}/{total_count} tệp. Mở thư mục kết quả để xem, hoặc thiết lập một lượt mới.")
-        else:
-            self._result_state = "Cần kiểm tra lại"
+        was_cancelled = getattr(self, '_cancelling', False) or (
+            hasattr(self.host, 'worker') and getattr(self.host.worker, '_cancel_requested', False)
+        )
+        self._cancelling = False
+        self._has_run_completed = True
+        self._finished = (success_count == total_count and total_count > 0 and not was_cancelled)
+
+        if was_cancelled:
+            self._result_state = "Đã hủy"
             self._validated_signature = None
-            self.result_label.setText(f"Đã tạo {success_count}/{total_count} tệp. Kiểm tra thông báo chi tiết trước khi thử lại.")
+            if success_count > 0:
+                self.result_label.setText(
+                    f"Tiến trình đã hủy. Đã hoàn tất {success_count}/{total_count} tệp trước khi dừng."
+                )
+            else:
+                self.result_label.setText("Tiến trình đã hủy. Không có tệp nào được tạo.")
+        elif self._finished:
+            self._result_state = "Đã hoàn tất"
+            self.result_label.setText(
+                f"Đã hoàn tất {success_count}/{total_count} tệp. Mở thư mục kết quả để xem, hoặc thiết lập một lượt mới."
+            )
+        else:
+            self._result_state = "Xuất thất bại"
+            self._validated_signature = None
+            if success_count > 0:
+                self.result_label.setText(
+                    f"Đã hoàn tất {success_count}/{total_count} tệp. Một số tệp gặp lỗi trong quá trình xuất."
+                )
+            else:
+                self.result_label.setText(
+                    f"Xuất thất bại (0/{total_count} tệp). Kiểm tra thông báo chi tiết trước khi thử lại."
+                )
         self.refresh()
 
     def show_error(self, message):
+        if getattr(self, '_cancelling', False) or self._result_state == "Đã hủy":
+            return
         self.result_label.setText(message)
         self.host.progress_panel.set_logs_visible(True)
 

@@ -49,7 +49,20 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "cache_enabled": True,
     "cache_max_gb": 5,
     "cache_folder": "",
+    "scratch_folder": "",
+    "auto_cleanup": True,
+    "temp_retention_hours": 24,
+    "storage_min_free_gb": 2,
     "theme": "dark",
+    "auto_save": True,
+    "window_geometry": "",
+    "window_x": None,
+    "window_y": None,
+    "window_width": 1320,
+    "window_height": 900,
+    "window_maximized": False,
+    "check_updates_on_startup": True,
+    "last_update_check": "",
 }
 
 _ENUMS = {
@@ -73,6 +86,8 @@ _RANGES = {
     "segment_duration": (1, 3600), "target_hours": (0, 48),
     "target_mins": (0, 59), "target_secs": (0, 59),
     "batch_count": (1, 100), "cache_max_gb": (1, 500),
+    "temp_retention_hours": (1, 720), "storage_min_free_gb": (1, 100),
+    "window_width": (500, 7680), "window_height": (400, 4320),
 }
 
 
@@ -96,6 +111,10 @@ def _validated(saved):
             if not low <= value <= high or (type(default) is int and int(value) != value):
                 continue
             value = type(default)(value)
+        elif key in ("window_x", "window_y"):
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                continue
+            value = int(value) if value is not None else None
         elif isinstance(default, str) and not isinstance(value, str):
             continue
         data[key] = value
@@ -212,13 +231,13 @@ class SettingsManager:
     def set(self, key, value, auto_save=True):
         with self._lock:
             self._data[key] = value
-            if auto_save:
+            if auto_save and (self._data.get("auto_save", True) or key == "auto_save"):
                 self.save()
 
     def update(self, mapping, auto_save=True):
         with self._lock:
             self._data.update(mapping)
-            if auto_save:
+            if auto_save and (self._data.get("auto_save", True) or "auto_save" in mapping):
                 self.save()
 
 

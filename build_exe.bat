@@ -33,6 +33,12 @@ echo.
 "%PY_BIN%" -m PyInstaller --noconfirm --clean AutoRandomVideoRemix.spec
 
 if %errorlevel% equ 0 (
+    "%PY_BIN%" scripts\build_updater.py "%~dp0dist\AutoRandomVideoRemix"
+    if errorlevel 1 (
+        echo [LOI] Khong tao duoc updater.exe. Ban dong goi chua hoan chinh.
+        pause
+        exit /b 1
+    )
     echo.
     echo ========================================================
     echo   [THANH CONG] DA TAO FILE EXE HOAN CHINH!

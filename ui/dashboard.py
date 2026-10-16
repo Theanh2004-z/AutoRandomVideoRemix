@@ -9,9 +9,12 @@ from PySide6.QtWidgets import (
     QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout, QGridLayout,
     QDialog, QScrollArea, QStackedWidget, QFormLayout, QSizePolicy, QCheckBox,
 )
-from qfluentwidgets import PushButton, PrimaryPushButton, ComboBox, LineEdit, SpinBox, FluentIcon, isDarkTheme, CheckBox
+from qfluentwidgets import (
+    PushButton, PrimaryPushButton, ComboBox, LineEdit, SpinBox, FluentIcon, isDarkTheme, CheckBox, SwitchButton, MessageBox
+)
 
 from core.settings_manager import settings
+from core.segment_renderer import frame_filter
 from ui.workflow import GuidedWorkflow, label
 from ui.workflow_state import evaluate_readiness
 from ui.components.source_panel import SourcePanel
@@ -28,9 +31,12 @@ from ui.window_frame import RemixTitleBar
 class PreviewWorker(QThread):
     ready = Signal(QImage)
 
-    def __init__(self, path, start, parent):
+    def __init__(self, path, start, parent, width=1920, height=1080, aspect_ratio_mode="fit"):
         super().__init__(parent)
         self.path, self.start_seconds = path, start
+        self.width = width
+        self.height = height
+        self.aspect_mode = aspect_ratio_mode
         self._process = None
         self._lock = threading.Lock()
 
@@ -42,26 +48,38 @@ class PreviewWorker(QThread):
                 except OSError: pass
 
     def run(self):
-        command = ['ffmpeg','-v','error','-nostdin','-threads','2','-ss',str(self.start_seconds),
-            '-i',self.path,'-an','-frames:v','1','-vf',
-            'scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2',
-            '-f','image2pipe','-c:v','png','pipe:1']
+        w, h = self.width, self.height
+        vf = frame_filter(w, h, self.aspect_mode) + ',' + frame_filter(480, 270, 'fit')
+        command = [
+            'ffmpeg', '-v', 'error', '-nostdin', '-threads', '2',
+            '-ss', str(self.start_seconds),
+            '-i', self.path,
+            '-an', '-frames:v', '1',
+            '-vf', vf,
+            '-f', 'image2pipe', '-c:v', 'png', 'pipe:1'
+        ]
         try:
             with self._lock:
                 if self.isInterruptionRequested(): return
-                self._process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+                self._process = subprocess.Popen(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+                )
             try:
-                data,_ = self._process.communicate(timeout=8)
+                data, _ = self._process.communicate(timeout=8)
             except subprocess.TimeoutExpired:
-                self._process.kill(); self._process.communicate(); return
-            if self._process.returncode==0 and not self.isInterruptionRequested():
-                image=QImage.fromData(data)
-                if not image.isNull(): self.ready.emit(image)
+                self._process.kill()
+                self._process.communicate()
+                return
+            if self._process.returncode == 0 and not self.isInterruptionRequested():
+                image = QImage.fromData(data)
+                if not image.isNull():
+                    self.ready.emit(image)
         except OSError:
             pass
         finally:
-            with self._lock: self._process=None
+            with self._lock:
+                self._process = None
 
 
 class DashboardWorkflow(GuidedWorkflow):
@@ -69,28 +87,38 @@ class DashboardWorkflow(GuidedWorkflow):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.preview_worker = None
         self._preview_signature = None
+        self._preview_pending = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
         self.header = RemixTitleBar(self.host)
         header = self.header
         self.host.install_title_bar(header)
-        bar = QHBoxLayout(header.content); bar.setContentsMargins(20,10,14,10); bar.setSpacing(10)
-        mark=QLabel('R',header); mark.setObjectName('brandMark'); mark.setFixedSize(36,36); mark.setAlignment(Qt.AlignCenter)
+        bar = QHBoxLayout(header.content); bar.setContentsMargins(14,0,10,0); bar.setSpacing(8)
+        mark=QLabel('R',header); mark.setObjectName('brandMark'); mark.setFixedSize(24,24); mark.setAlignment(Qt.AlignCenter)
         bar.addWidget(mark)
-        brand=QVBoxLayout();brand.setSpacing(0)
-        brand.addWidget(label('REMIX','dashboardBrand'))
-        tagline=label('Tạo nội dung từ kho của bạn','mutedText');tagline.setWordWrap(False);brand.addWidget(tagline)
-        bar.addLayout(brand);bar.addSpacing(14)
+        bar.addWidget(label('REMIX','dashboardBrand'))
+        bar.addSpacing(12)
+        self.auto_save_switch=SwitchButton('Tự lưu',header)
+        self.auto_save_switch.setObjectName('autoSaveSwitch')
+        self.auto_save_switch.setChecked(settings.get('auto_save',True))
+        self.auto_save_switch.setOnText('Tự lưu')
+        self.auto_save_switch.setOffText('Tự lưu')
+        self.auto_save_switch.setToolTip('Bật để tự động lưu thiết lập khi thay đổi')
+        self.auto_save_switch.checkedChanged.connect(self._on_auto_save_toggled)
+        bar.addWidget(self.auto_save_switch)
         self.save_button=PushButton(FluentIcon.SAVE,'Lưu thiết lập',header)
-        self.save_button.clicked.connect(self.save_preferences);bar.addWidget(self.save_button)
-        self.save_status=label('Tự động ghi nhớ','mutedText');bar.addWidget(self.save_status)
+        self.save_button.setFixedHeight(28)
+        self.save_button.clicked.connect(self.save_preferences)
+        bar.addWidget(self.save_button)
+        self.save_button.setVisible(not settings.get('auto_save',True))
+        self.save_status=label('','mutedText');self.save_status.setObjectName('saveStatusLabel');bar.addWidget(self.save_status)
         bar.addStretch()
-        self.host.btn_theme=PushButton('Giao diện tối',header);self.host.btn_theme.clicked.connect(self.host._toggle_theme)
+        self.host.btn_theme=PushButton('Giao diện tối',header);self.host.btn_theme.setFixedHeight(28);self.host.btn_theme.clicked.connect(self.host._toggle_theme)
         bar.addWidget(self.host.btn_theme)
-        self.settings_button=PushButton(FluentIcon.SETTING,'Cài đặt',header)
+        self.settings_button=PushButton(FluentIcon.SETTING,'Cài đặt',header);self.settings_button.setFixedHeight(28)
         self.settings_button.clicked.connect(self.open_settings);bar.addWidget(self.settings_button)
-        self.export_button=PrimaryPushButton(FluentIcon.SEND,'Xuất',header)
-        self.export_button.setMinimumWidth(110);self.export_button.clicked.connect(self.open_export)
+        self.export_button=PrimaryPushButton(FluentIcon.SEND,'Xuất',header);self.export_button.setFixedHeight(28)
+        self.export_button.setMinimumWidth(95);self.export_button.clicked.connect(self.request_export)
         bar.addWidget(self.export_button)
 
         self.canvas=QWidget(self);self.canvas.setObjectName('dashboardCanvas')
@@ -183,6 +211,19 @@ class DashboardWorkflow(GuidedWorkflow):
         self.host.cut_panel.lbl_summary.setObjectName('mutedText')
         self.host.cut_panel.layout().setSpacing(8)
         layout.addWidget(self.host.cut_panel)
+
+        # Đưa độ dài mỗi đoạn video vào phần Video nguồn (vị trí dưới "Xem danh sách video")
+        self.seg_duration_row = QWidget(self.video_body)
+        self.seg_duration_row.setObjectName('segDurationRow')
+        seg_layout = QHBoxLayout(self.seg_duration_row)
+        seg_layout.setContentsMargins(0, 4, 0, 0)
+        seg_layout.setSpacing(10)
+        self.host.cut_panel.segment_caption.setText("Độ dài mỗi đoạn video:")
+        self.host.cut_panel.segment_caption.setStyleSheet("font-weight: 500;")
+        seg_layout.addWidget(self.host.cut_panel.segment_caption)
+        seg_layout.addWidget(self.host.cut_panel.spin_seg_dur, 1)
+        self.video_body.layout().addWidget(self.seg_duration_row)
+
         self.audio_settings_card=QFrame(self.host);self.audio_settings_card.setObjectName('settingsCard')
         audio=QVBoxLayout(self.audio_settings_card);audio.addWidget(label('Cách ghép âm thanh','sectionHeader'))
         audio.addWidget(self.host.audio_panel.options_widget)
@@ -213,6 +254,8 @@ class DashboardWorkflow(GuidedWorkflow):
 
     def _build_export(self):
         self.export_dialog=QDialog(self.host);self.export_dialog.setWindowTitle('Xuất nội dung · Remix')
+        self.export_dialog.setWindowFlags((self.export_dialog.windowFlags() | Qt.CustomizeWindowHint | Qt.WindowTitleHint) & ~Qt.WindowCloseButtonHint)
+        self.export_dialog.closeEvent=self._on_export_dialog_close_event
         self.export_dialog.resize(920,640);self.export_dialog.setMinimumSize(780,560)
         self.export_dialog.setWindowModality(Qt.WindowModal)
         container=QVBoxLayout(self.export_dialog);container.setContentsMargins(22,20,22,18);container.setSpacing(14)
@@ -251,17 +294,27 @@ class DashboardWorkflow(GuidedWorkflow):
         confirm_scroll.setWidget(self.confirm_page);self.export_stack.addWidget(confirm_scroll)
         progress_page=QWidget();progress_page.setObjectName('settingsBody');progress=QVBoxLayout(progress_page);progress.setContentsMargins(0,0,0,0);progress.setSpacing(10)
         self.output_name=label('','summaryDetail');progress.addWidget(self.output_name)
-        self.host.progress_panel=ProgressPanel(progress_page);self.host.progress_panel.prep_widget.hide();self.host.progress_panel.btn_start.hide()
-        self.host.progress_panel.lbl_overall.setWordWrap(True);self.host.progress_panel.console.setMinimumHeight(120)
+        self.host.progress_panel=ProgressPanel(progress_page)
+        self.host.progress_panel.prep_widget.hide()
+        self.host.progress_panel.action_widget.hide()
+        self.host.progress_panel.lbl_overall.setWordWrap(True)
+        self.host.progress_panel.console.setMinimumHeight(120)
         progress.addWidget(self.host.progress_panel)
         self.result_label=label('','resultMessage');progress.addWidget(self.result_label)
-        actions=QHBoxLayout();self.open_output_button=PushButton('Mở kết quả',progress_page)
+        actions=QHBoxLayout();actions.setSpacing(10)
+        self.open_output_button=PushButton('Mở kết quả',progress_page)
         self.open_output_button.clicked.connect(self.host.output_panel._open_outdir)
-        self.new_run_button=PushButton('Lượt mới',progress_page);self.new_run_button.clicked.connect(self.new_run)
-        actions.addWidget(self.open_output_button);actions.addWidget(self.new_run_button);progress.addLayout(actions);progress.addStretch()
+        self.open_output_button.hide()
+        self.new_run_button=PushButton('Lượt mới',progress_page)
+        self.new_run_button.clicked.connect(self.new_run)
+        self.new_run_button.hide()
+        actions.addWidget(self.open_output_button)
+        actions.addWidget(self.new_run_button)
+        progress.addLayout(actions)
+        progress.addStretch()
         self.export_stack.addWidget(progress_page)
         bottom=QHBoxLayout();self.confirm_hint=label('','mutedText');bottom.addWidget(self.confirm_hint,1)
-        self.dialog_close=PushButton('Đóng',self.export_dialog);self.dialog_close.clicked.connect(self.export_dialog.reject);bottom.addWidget(self.dialog_close)
+        self.dialog_close=PushButton('Đóng',self.export_dialog);self.dialog_close.clicked.connect(self._on_dialog_close_clicked);bottom.addWidget(self.dialog_close)
         self.confirm_button=PrimaryPushButton('Xuất',self.export_dialog);self.confirm_button.setMinimumWidth(100)
         self.confirm_button.clicked.connect(self.confirm_export);bottom.addWidget(self.confirm_button);container.addLayout(bottom)
 
@@ -285,33 +338,56 @@ class DashboardWorkflow(GuidedWorkflow):
         row.setToolTip(check.detail);return row
 
     def _refresh_navigation(self,value,readiness,prepared):
+        worker = getattr(self.host, 'worker', None)
+        worker_running = bool(worker and worker.isRunning())
+        is_running = self._running or worker_running
+        is_cancelling = getattr(self, '_cancelling', False)
+
         self.export_button.setEnabled(True)
-        self.export_button.setText('Xem tiến trình' if self._running else 'Xem kết quả' if self._finished else 'Xuất')
-        self.export_button.setToolTip('Mở tiến trình đang chạy' if self._running else readiness.next_action)
-        self.save_button.setEnabled(not self._running)
-        self.video_toggle.setEnabled(not self._running)
-        self.audio_toggle.setEnabled(not self._running)
-        self.footer_hint.setText('Đang xuất nội dung. Có thể ẩn bảng tiến trình và mở lại bằng nút phía trên.' if self._running else
+        if is_cancelling:
+            self.export_button.setText('Đang hủy…')
+            self.export_button.setToolTip('Tiến trình xuất đang được hủy')
+        elif is_running:
+            self.export_button.setText('Xem tiến trình')
+            self.export_button.setToolTip('Mở tiến trình đang chạy')
+        elif self._finished or bool(self._result_state) or getattr(self, '_has_run_completed', False):
+            self.export_button.setText('Xuất')
+            self.export_button.setToolTip('Bắt đầu lượt xuất mới' if readiness.can_prepare else readiness.next_action)
+        else:
+            self.export_button.setText('Xuất')
+            self.export_button.setToolTip(readiness.next_action)
+
+        self.save_button.setEnabled(not is_running)
+        self.save_button.setVisible(not self.auto_save_switch.isChecked())
+        self.auto_save_switch.setEnabled(not is_running)
+        self.video_toggle.setEnabled(not is_running)
+        self.audio_toggle.setEnabled(not is_running)
+        self.footer_hint.setText('Đang hủy tiến trình xuất…' if is_cancelling else
+                                'Đang xuất nội dung. Có thể ẩn bảng tiến trình và mở lại bằng nút phía trên.' if is_running else
                                 'Đang chuẩn bị kế hoạch trong nền…' if self._preparing else
                                 'Nguồn và kế hoạch đã sẵn sàng. Nhấn Xuất để kiểm tra lần cuối.' if prepared else readiness.next_action)
-        self.retry_button.setVisible(bool(self._plan_error or self._result_state=='Cần kiểm tra lại') and not self._preparing)
-        self.plan_button.setEnabled(prepared or self._running or self._finished)
-        if self.export_dialog.isVisible() and prepared and not self._running:
+        self.retry_button.setVisible(bool(self._plan_error or self._result_state in ('Cần kiểm tra lại', 'Xuất thất bại')) and not self._preparing)
+        self.plan_button.setEnabled(prepared or is_running or self._finished)
+        if self.export_dialog.isVisible() and prepared and not is_running:
             self._request_preview()
-        enabled=prepared and readiness.can_prepare and not self._running and not self.settings_dialog.cache_busy
-        self.confirm_button.setEnabled(enabled);self.confirm_button.setText(f'Xuất {value.batch_count} tệp')
-        self.confirm_hint.setText('' if self._running else 'Sẵn sàng xuất' if enabled else 'Đang chuẩn bị kế hoạch…' if self._preparing else readiness.next_action)
-        self.confirm_page.setEnabled(not self._running)
-        audio_only=value.target=='audio_only'
-        for widget in self.video_rows:widget.setVisible(not audio_only)
-        self.audio_format.setVisible(audio_only);self.audio_format_label.setVisible(audio_only)
-        if self._running or self._finished or self.export_stack.currentIndex()==1:
+        enabled = prepared and readiness.can_prepare and not is_running and not self.settings_dialog.cache_busy and not is_cancelling
+        self.confirm_button.setEnabled(enabled)
+        self.confirm_button.setText(f'Xuất {value.batch_count} tệp')
+        self.confirm_hint.setText('' if is_running else 'Sẵn sàng xuất' if enabled else 'Đang chuẩn bị kế hoạch…' if self._preparing else readiness.next_action)
+        self.confirm_page.setEnabled(not is_running)
+        audio_only = value.target == 'audio_only'
+        for widget in self.video_rows:
+            widget.setVisible(not audio_only)
+        self.audio_format.setVisible(audio_only)
+        self.audio_format_label.setVisible(audio_only)
+        if self.export_stack.currentIndex() == 0:
+            self.confirm_button.show()
+        else:
             self.confirm_button.hide()
-        else:self.confirm_button.show()
 
     def refresh(self, *args):
         super().refresh(*args)
-        if self.host.audio_panel.get_export_target()=='none':
+        if self.host.audio_panel.get_export_target() == 'none':
             self.summary_title.setText('Chọn nội dung cần xuất')
             self.summary_detail.clear()
             self.plan_notice.setText('Tích Video, Âm thanh hoặc cả hai để bắt đầu.')
@@ -319,48 +395,226 @@ class DashboardWorkflow(GuidedWorkflow):
         elif self.validated() and not self._preparing:
             self.plan_notice.setText('Kế hoạch đã sẵn sàng. Mở Xem kế hoạch để kiểm tra thứ tự ghép.')
 
+    def request_export(self):
+        worker = getattr(self.host, 'worker', None)
+        worker_running = bool(worker and worker.isRunning())
+        is_running = self._running or worker_running or getattr(self, '_cancelling', False)
+
+        if is_running:
+            self.open_export()
+            return
+
+        if self._finished or bool(self._result_state) or getattr(self, '_has_run_completed', False):
+            self.begin_new_run()
+            self.export_dialog.open()
+            return
+
+        self.open_export()
+
     def open_export(self):
         self.refresh()
-        if self._running or self._finished:
+        target = self.host.audio_panel.get_export_target()
+        out_cfg = self.host.output_panel.get_config()
+        has_audio = (out_cfg.audio_mode != "none") if target == "video_only" else True
+        self.host.progress_panel.set_export_mode(target, has_audio=has_audio)
+        worker = getattr(self.host, 'worker', None)
+        worker_running = bool(worker and worker.isRunning())
+        is_running = self._running or worker_running
+        is_cancelling = getattr(self, '_cancelling', False)
+
+        if is_cancelling or is_running or self._finished or bool(self._result_state):
             self.export_stack.setCurrentIndex(1)
-            self.dialog_title.setText('Đang xuất nội dung' if self._running else 'Kết quả xuất')
+            if is_cancelling:
+                self.dialog_title.setText('Đang hủy…')
+            elif is_running:
+                self.dialog_title.setText('Đang xuất nội dung')
+            elif self._result_state == "Đã hủy":
+                self.dialog_title.setText('Đã hủy xuất')
+            elif self._finished or self._result_state == "Đã hoàn tất":
+                self.dialog_title.setText('Xuất hoàn tất')
+            elif self._result_state == "Xuất thất bại":
+                self.dialog_title.setText('Xuất thất bại')
+            else:
+                self.dialog_title.setText('Kết quả xuất')
             self.confirm_button.hide()
+            if not is_running and not is_cancelling:
+                out_dir = self.host.output_panel.edit_outdir.text().strip()
+                self.open_output_button.setEnabled(bool(os.path.isdir(out_dir)))
+                self.open_output_button.show()
+                self.new_run_button.setEnabled(True)
+                self.new_run_button.show()
         else:
-            self.export_stack.setCurrentIndex(0);self.dialog_title.setText('Kiểm tra và xuất')
+            self.export_stack.setCurrentIndex(0)
+            self.dialog_title.setText('Kiểm tra và xuất')
             self.confirm_button.show()
-        self.dialog_close.setText('Ẩn tiến trình' if self._running else 'Đóng')
-        self.export_dialog.open();self._request_preview()
+        self._update_dialog_close_state()
+        self.export_dialog.open()
+        self._request_preview()
+
+    def open_results(self):
+        self.refresh()
+        self.export_stack.setCurrentIndex(1)
+        if self._result_state == "Đã hủy":
+            self.dialog_title.setText('Đã hủy xuất')
+        elif self._finished or self._result_state == "Đã hoàn tất":
+            self.dialog_title.setText('Xuất hoàn tất')
+        elif self._result_state == "Xuất thất bại":
+            self.dialog_title.setText('Xuất thất bại')
+        else:
+            self.dialog_title.setText('Kết quả xuất')
+        self.confirm_button.hide()
+        out_dir = self.host.output_panel.edit_outdir.text().strip()
+        self.open_output_button.setEnabled(bool(os.path.isdir(out_dir)))
+        self.open_output_button.show()
+        self.new_run_button.setEnabled(True)
+        self.new_run_button.show()
+        self._update_dialog_close_state()
+        self.export_dialog.open()
 
     def confirm_export(self):
+        worker = getattr(self.host, 'worker', None)
+        if worker and worker.isRunning():
+            return
+        if self._running or getattr(self, '_cancelling', False):
+            return
         self.refresh()
-        if self.validated() and self.confirm_button.isEnabled() and not self._running:
+        if self.validated() and self.confirm_button.isEnabled():
             self.host.progress_panel.btn_start.click()
 
+    def cancel_export(self):
+        self._cancelling = True
+        self.dialog_close.setEnabled(False)
+        self.dialog_close.setText('Đang hủy…')
+        self._update_dialog_close_state()
+        self.refresh()
+        self.host.progress_panel.cancel_requested.emit()
+
+    def _on_dialog_close_clicked(self):
+        worker = getattr(self.host, 'worker', None)
+        is_running = self._running or bool(worker and worker.isRunning())
+        if is_running:
+            if getattr(self, '_cancelling', False):
+                return
+            w = MessageBox('Xác nhận hủy', 'Bạn có chắc chắn muốn hủy tiến trình xuất video không?', self.export_dialog)
+            w.yesButton.setText('Hủy xuất')
+            w.cancelButton.setText('Tiếp tục')
+            if w.exec():
+                self.cancel_export()
+        else:
+            self.export_dialog.reject()
+
+    def _on_export_dialog_close_event(self, event):
+        worker = getattr(self.host, 'worker', None)
+        is_running = self._running or bool(worker and worker.isRunning())
+        if is_running:
+            if getattr(self, '_cancelling', False):
+                event.ignore()
+                return
+            w = MessageBox('Xác nhận hủy', 'Bạn có chắc chắn muốn hủy tiến trình xuất video không?', self.export_dialog)
+            w.yesButton.setText('Hủy xuất')
+            w.cancelButton.setText('Tiếp tục')
+            if w.exec():
+                self.cancel_export()
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+    def _update_dialog_close_state(self):
+        worker = getattr(self.host, 'worker', None)
+        is_running = self._running or bool(worker and worker.isRunning())
+        if getattr(self, '_cancelling', False):
+            self.dialog_close.setEnabled(False)
+            self.dialog_close.setText('Đang hủy…')
+            self.dialog_close.setStyleSheet('color: #FF4D4F; font-weight: 600;')
+            self.dialog_close.setToolTip('Đang dừng tiến trình xuất…')
+        elif is_running:
+            self.dialog_close.setEnabled(True)
+            self.dialog_close.setText('Hủy')
+            self.dialog_close.setStyleSheet('color: #FF4D4F; font-weight: 600;')
+            self.dialog_close.setToolTip('Hủy tiến trình xuất đang chạy')
+        else:
+            self.dialog_close.setEnabled(True)
+            self.dialog_close.setText('Đóng')
+            self.dialog_close.setStyleSheet('')
+            self.dialog_close.setToolTip('Đóng cửa sổ này')
+
     def _request_preview(self):
-        target=self.host.audio_panel.get_export_target()
-        if target=='audio_only':
-            self.preview.clear();self.preview.setText('♫\nPlaylist âm thanh');self.preview_source.setText('Ghép nhạc theo kế hoạch đã kiểm tra.');return
-        plans=self.host.current_batch_plans
+        if self._closing:
+            return
+        target = self.host.audio_panel.get_export_target()
+        if target == 'audio_only':
+            self._preview_signature = None
+            self._preview_pending = False
+            if self.preview_worker:
+                self.preview_worker.stop()
+            self.preview.clear()
+            self.preview.setText('♫\nPlaylist âm thanh')
+            self.preview_source.setText('Ghép nhạc theo kế hoạch đã kiểm tra.')
+            return
+        plans = self.host.current_batch_plans
         if not plans or not plans[0]:
-            self.preview.clear();self.preview.setText('REMIX\nChưa có kế hoạch');self.preview_source.clear();return
-        clip=plans[0][0];signature=(clip.source_video_path,clip.start_sec)
-        if self.preview_worker and self.preview_worker.isRunning():return
-        if signature==self._preview_signature:return
-        self._preview_signature=signature;self.preview.clear();self.preview.setText('Đang lấy khung hình…')
+            self._preview_signature = None
+            self._preview_pending = False
+            if self.preview_worker:
+                self.preview_worker.stop()
+            self.preview.clear()
+            self.preview.setText('REMIX\nChưa có kế hoạch')
+            self.preview_source.clear()
+            return
+        clip = plans[0][0]
+        out_cfg = self.host.output_panel.get_config()
+        out_w, out_h = out_cfg.width_height
+        aspect_mode = out_cfg.aspect_ratio_mode
+        signature = (clip.source_video_path, clip.start_sec, out_w, out_h, aspect_mode)
+        # Keep the old worker referenced until its finished signal is handled.
+        # A stop request is asynchronous; never replace a running QThread.
+        if self.preview_worker is not None:
+            if signature == self._preview_signature:
+                return
+            self._preview_signature = signature
+            self._preview_pending = True
+            self.preview.clear()
+            self.preview.setText('Đang lấy khung hình…')
+            self.preview_worker.stop()
+            return
+        if signature == self._preview_signature:
+            return
+        self._preview_signature = signature
+        self.preview.clear()
+        self.preview.setText('Đang lấy khung hình…')
         self.preview_source.setText(clip.source_video_name)
-        self.preview_worker=PreviewWorker(clip.source_video_path,clip.start_sec,self)
-        self.preview_worker.ready.connect(self._accept_preview);self.preview_worker.finished.connect(self._preview_finished)
+        self.preview_worker = PreviewWorker(
+            clip.source_video_path, clip.start_sec, self,
+            width=out_w, height=out_h, aspect_ratio_mode=aspect_mode
+        )
+        self.preview_worker.ready.connect(self._accept_preview)
+        self.preview_worker.finished.connect(self._preview_finished)
         self.preview_worker.start()
 
-    def _accept_preview(self,image):
-        worker=self.sender();plans=self.host.current_batch_plans
-        if plans and plans[0] and (plans[0][0].source_video_path,plans[0][0].start_sec)==(worker.path,worker.start_seconds):
-            self.preview.setPixmap(QPixmap.fromImage(image).scaled(self.preview.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation))
+    def _accept_preview(self, image):
+        worker = self.sender()
+        if self._closing or worker is not self.preview_worker or worker.isInterruptionRequested():
+            return
+        worker_sig = (worker.path, worker.start_seconds, worker.width, worker.height, worker.aspect_mode)
+        if worker_sig == self._preview_signature:
+            self.preview.setPixmap(QPixmap.fromImage(image).scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _preview_finished(self):
-        worker=self.sender()
-        if self.preview_worker is worker:self.preview_worker=None
+        worker = self.sender()
+        if self.preview_worker is not worker:
+            worker.deleteLater()
+            return
+        self.preview_worker = None
         worker.deleteLater()
+        pending, self._preview_pending = self._preview_pending, False
+        if self._closing:
+            return
+        if pending:
+            self._preview_signature = None
+            self._request_preview()
+            return
         if self.host.audio_panel.get_export_target()!='audio_only' and (not self.preview.pixmap() or self.preview.pixmap().isNull()):
             self.preview.setText('REMIX\nChưa có khung hình xem trước')
 
@@ -373,11 +627,23 @@ class DashboardWorkflow(GuidedWorkflow):
     def retry_prepare(self):
         self._failed_signature=None;self.prepare()
 
+    def _on_auto_save_toggled(self, checked):
+        settings.set('auto_save', checked)
+        self.save_button.setVisible(not checked)
+        if checked:
+            self.save_preferences()
+        else:
+            self.save_status.setText('')
+            self.auto_save_switch.setToolTip('Tự động lưu đang tắt — gạt để bật tự lưu')
+
     def save_preferences(self):
-        if settings.save():self.save_status.setText('Đã lưu thiết lập')
+        if settings.save():
+            self.save_status.setText('Đã lưu thiết lập')
+            self.auto_save_switch.setToolTip('Đã lưu thiết lập thành công')
         else:
             self.save_status.setText('Chưa lưu được — kiểm tra quyền ghi')
             self.save_status.setToolTip(settings.last_error)
+            self.auto_save_switch.setToolTip('Chưa lưu được: ' + settings.last_error)
 
     def apply_theme(self,dark):
         super().apply_theme(dark)
@@ -388,9 +654,21 @@ class DashboardWorkflow(GuidedWorkflow):
     def running_changed(self,running):
         super().running_changed(running)
         if running:
-            self.export_stack.setCurrentIndex(1);self.confirm_button.hide();self.dialog_title.setText('Đang xuất nội dung')
-            self.dialog_close.setText('Ẩn tiến trình')
+            target = self.host.audio_panel.get_export_target()
+            out_cfg = self.host.output_panel.get_config()
+            has_audio = (out_cfg.audio_mode != "none") if target == "video_only" else True
+            self.host.progress_panel.set_export_mode(target, has_audio=has_audio)
+            self.export_stack.setCurrentIndex(1)
+            self.confirm_button.hide()
+            self.dialog_title.setText('Đang xuất nội dung')
+            self._update_dialog_close_state()
+            self.result_label.setText('')
+            self.open_output_button.hide()
+            self.new_run_button.hide()
             self.host.progress_panel.lbl_overall.setText('Đang chuẩn bị bộ xử lý…')
+        else:
+            self._cancelling = False
+            self._update_dialog_close_state()
 
     def attach_worker(self,worker):
         super().attach_worker(worker)
@@ -398,11 +676,70 @@ class DashboardWorkflow(GuidedWorkflow):
 
     def finished(self,success_count,total_count):
         super().finished(success_count,total_count)
-        self.dialog_title.setText('Xuất hoàn tất' if self._finished else 'Kết quả xử lý')
-        self.dialog_close.setText('Đóng');self.export_stack.setCurrentIndex(1);self.confirm_button.hide()
+        self._cancelling = False
+        if self._result_state == "Đã hủy":
+            self.dialog_title.setText('Đã hủy xuất')
+        elif self._finished or self._result_state == "Đã hoàn tất":
+            self.dialog_title.setText('Xuất hoàn tất')
+        elif self._result_state == "Xuất thất bại":
+            self.dialog_title.setText('Xuất thất bại')
+        else:
+            self.dialog_title.setText('Kết quả xử lý')
+        self._update_dialog_close_state()
+        self.export_stack.setCurrentIndex(1)
+        self.confirm_button.hide()
+        self.open_output_button.setEnabled(bool(success_count > 0))
+        self.open_output_button.show()
+        self.new_run_button.setEnabled(True)
+        self.new_run_button.show()
+
+    def begin_new_run(self):
+        worker = getattr(self.host, 'worker', None)
+        if worker and worker.isRunning():
+            return False
+        if self._running or getattr(self, '_cancelling', False):
+            return False
+
+        self._finished = False
+        self._result_state = ""
+        self._plan_error = ""
+        self._validated_signature = None
+        self._cancelling = False
+        self._has_run_completed = False
+        self.host._plan_is_stale = True
+        self.host.current_batch_plans = []
+        self.host.current_audio_playlists = []
+
+        self.export_stack.setCurrentIndex(0)
+        self.dialog_title.setText('Kiểm tra và xuất')
+        self.confirm_button.setEnabled(False)
+        self.confirm_button.show()
+        self.open_output_button.hide()
+        self.new_run_button.hide()
+        self._update_dialog_close_state()
+
+        self.host.progress_panel.reset_bars()
+        self.output_name.setText('')
+        self.result_label.setText('')
+        self.host.progress_panel.lbl_overall.setText('Sẵn sàng')
+
+        target = self.host.audio_panel.get_export_target()
+        out_cfg = self.host.output_panel.get_config()
+        has_audio = (out_cfg.audio_mode != "none") if target == "video_only" else True
+        self.host.progress_panel.set_export_mode(target, has_audio=has_audio)
+
+        self.refresh()
+        self._request_preview()
+        self.prepare()
+        return True
+
+    def new_run(self):
+        return self.begin_new_run()
 
     def stop_background(self):
         super().stop_background()
+        self._preview_pending = False
+        self._preview_signature = None
         if self.preview_worker:self.preview_worker.stop()
         for dialog in (self.export_dialog,self.plan_dialog,self.source_list_dialog):dialog.close()
 

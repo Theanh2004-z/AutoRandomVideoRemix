@@ -108,6 +108,18 @@ class PlanWorker(QThread):
             self.failed.emit(str(error))
 
 
+class StorageMaintenanceWorker(QThread):
+    result = Signal(object)
+    failed = Signal(str)
+
+    def run(self):
+        try:
+            from core.storage_cleanup import maintain_storage
+            self.result.emit(maintain_storage(self.isInterruptionRequested))
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class CacheWorker(QThread):
     result = Signal(object)
     failed = Signal(str)

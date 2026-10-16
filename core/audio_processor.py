@@ -2,6 +2,7 @@
 Audio Processor Engine — renders, trims, standardizes and concatenates audio playlists.
 Produces standalone audio files (MP3, M4A, WAV) or temporary audio for video muxing.
 """
+from core.storage_cleanup import Workspace, SpaceGuard, stop_owned_process
 import os
 import shutil
 import subprocess
@@ -17,15 +18,18 @@ class AudioProcessorEngine:
     def __init__(
         self,
         on_log: Optional[Callable[[str, str], None]] = None,
-        on_progress: Optional[Callable[[float, str], None]] = None
+        on_progress: Optional[Callable[[float, str], None]] = None,
+        scratch_dir: Optional[str] = None
     ):
         self.on_log = on_log or (lambda lvl, msg: None)
         self.on_progress = on_progress or (lambda pct, msg: None)
+        self.scratch_dir = scratch_dir
 
         self._is_paused = False
         self._is_cancelled = False
         self._current_subprocess: Optional[subprocess.Popen] = None
         self._temp_dir: Optional[str] = None
+        self._workspace = None
 
     def pause(self):
         self._is_paused = True
@@ -47,16 +51,43 @@ class AudioProcessorEngine:
                     self._current_subprocess.kill()
                 except Exception:
                     pass
-        self._cleanup_temp_dir()
+        # The processing thread cleans up after the subprocess has stopped.
 
     def _cleanup_temp_dir(self):
-        if self._temp_dir and os.path.isdir(self._temp_dir):
+        if self._workspace:
             try:
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+                self._workspace.cleanup()
+                self._workspace = None
+            except OSError as error:
+                self.on_log("WARNING", f"Chưa dọn hết tệp tạm; sẽ thử lại sau: {error}")
 
-    def process_audio_playlist(
+    def process_audio_playlist(self, playlist, output_file_path, target_sample_rate=48000, output_format="mp3"):
+        from core.app_paths import get_scratch_dir
+        scratch = self.scratch_dir or get_scratch_dir()
+        os.makedirs(scratch, exist_ok=True)
+        output = os.path.dirname(os.path.abspath(output_file_path))
+        os.makedirs(output, exist_ok=True)
+        guard = SpaceGuard([scratch, output], self)
+        existed = os.path.lexists(output_file_path)
+        success = False
+        try:
+            if not guard.start():
+                return False
+            success = self._process_audio_playlist(playlist, output_file_path, target_sample_rate, output_format)
+            return success
+        finally:
+            guard.close()
+            stopped = stop_owned_process(self)
+            if stopped:
+                self._current_subprocess = None
+                self._cleanup_temp_dir()
+            if stopped and not success and not existed:
+                try:
+                    os.remove(output_file_path)
+                except OSError:
+                    pass
+
+    def _process_audio_playlist(
         self,
         playlist: List[AudioPlaylistItem],
         output_file_path: str,
@@ -85,11 +116,11 @@ class AudioProcessorEngine:
         os.makedirs(os.path.dirname(os.path.abspath(output_file_path)), exist_ok=True)
 
         temp_id = uuid.uuid4().hex[:8]
-        self._temp_dir = os.path.join(
-            os.path.dirname(os.path.abspath(output_file_path)),
-            f"_temp_audio_{temp_id}"
-        )
-        os.makedirs(self._temp_dir, exist_ok=True)
+        from core.app_paths import get_scratch_dir
+        scratch_base = self.scratch_dir or get_scratch_dir()
+        os.makedirs(scratch_base, exist_ok=True)
+        self._workspace = Workspace(scratch_base, "audio")
+        self._temp_dir = str(self._workspace.path)
 
         total_tracks = len(playlist)
         self.on_log("INFO", f"=== Bắt đầu ghép {total_tracks} bài âm thanh ngẫu nhiên ===")
@@ -102,7 +133,6 @@ class AudioProcessorEngine:
                 time.sleep(0.3)
 
             if self._is_cancelled:
-                self._cleanup_temp_dir()
                 return False
 
             item.status = "Đang xử lý"
@@ -145,7 +175,6 @@ class AudioProcessorEngine:
                 _, stderr = self._current_subprocess.communicate()
 
                 if self._is_cancelled:
-                    self._cleanup_temp_dir()
                     return False
 
                 if self._current_subprocess.returncode != 0:
@@ -153,7 +182,6 @@ class AudioProcessorEngine:
                     tail_err = "\n".join(err.strip().splitlines()[-5:])
                     self.on_log("ERROR", f"Lỗi chuẩn hóa bài {item.source_audio_name}: {tail_err}")
                     item.status = "Lỗi"
-                    self._cleanup_temp_dir()
                     return False
 
                 item.status = "Hoàn tất"
@@ -162,7 +190,6 @@ class AudioProcessorEngine:
             except Exception as e:
                 self.on_log("ERROR", f"Ngoại lệ khi xử lý bài {item.source_audio_name}: {e}")
                 item.status = "Lỗi"
-                self._cleanup_temp_dir()
                 return False
 
         # Step 2: Seamless concat
@@ -194,19 +221,16 @@ class AudioProcessorEngine:
             _, stderr = self._current_subprocess.communicate()
 
             if self._is_cancelled:
-                self._cleanup_temp_dir()
                 return False
 
             if self._current_subprocess.returncode != 0:
                 err = stderr.decode('utf-8', errors='replace') if stderr else "Unknown error"
                 tail_err = "\n".join(err.strip().splitlines()[-5:])
                 self.on_log("ERROR", f"Lỗi ghép concat audio: {tail_err}")
-                self._cleanup_temp_dir()
                 return False
 
         except Exception as e:
             self.on_log("ERROR", f"Ngoại lệ ghép concat audio: {e}")
-            self._cleanup_temp_dir()
             return False
 
         # Step 3: Final export encoding
@@ -221,10 +245,12 @@ class AudioProcessorEngine:
                         os.remove(output_file_path)
                     except Exception:
                         pass
-                shutil.copy2(merged_wav, output_file_path)
+                try:
+                    os.replace(merged_wav, output_file_path)
+                except OSError:
+                    shutil.copy2(merged_wav, output_file_path)
             except Exception as e:
                 self.on_log("ERROR", f"Lỗi lưu file âm thanh WAV: {e}")
-                self._cleanup_temp_dir()
                 return False
         else:
             export_cmd = ["ffmpeg", "-y", "-i", merged_wav]
@@ -246,27 +272,22 @@ class AudioProcessorEngine:
                 _, stderr = self._current_subprocess.communicate()
 
                 if self._is_cancelled:
-                    self._cleanup_temp_dir()
                     return False
 
                 if self._current_subprocess.returncode != 0:
                     err = stderr.decode('utf-8', errors='replace') if stderr else "Unknown error"
                     tail_err = "\n".join(err.strip().splitlines()[-5:])
                     self.on_log("ERROR", f"Lỗi xuất file audio: {tail_err}")
-                    self._cleanup_temp_dir()
                     return False
 
             except Exception as e:
                 self.on_log("ERROR", f"Ngoại lệ xuất file audio: {e}")
-                self._cleanup_temp_dir()
                 return False
 
         if not os.path.isfile(output_file_path) or os.path.getsize(output_file_path) < 1000:
             self.on_log("ERROR", "File âm thanh xuất rỗng hoặc không tồn tại.")
-            self._cleanup_temp_dir()
             return False
 
-        self._cleanup_temp_dir()
         self.on_progress(100.0, "Ghép nối âm thanh hoàn tất!")
         self.on_log("SUCCESS", f"✓ Đã xuất thành công: {os.path.basename(output_file_path)}")
         return True

@@ -99,7 +99,7 @@ class SourceSelectionTests(unittest.TestCase):
         close_y=header.closeBtn.mapTo(self.win,header.closeBtn.rect().center()).y()
         self.assertLessEqual(abs(export_y-close_y),2)
         self.assertGreaterEqual(self.flow.mapTo(self.win,QPoint()).y(),header.height())
-        for widget in (self.flow.save_button,self.flow.settings_button,self.flow.export_button,header.closeBtn):
+        for widget in (self.flow.auto_save_switch,self.flow.settings_button,self.flow.export_button,header.closeBtn):
             point=widget.mapTo(header,widget.rect().center())
             self.assertFalse(header.canDrag(point))
 
@@ -108,7 +108,7 @@ class SourceSelectionTests(unittest.TestCase):
         header=self.flow.header
         header.maxBtn.click();self.assertTrue(self.win.isMaximized())
         header.maxBtn.click();self.assertFalse(self.win.isMaximized())
-        point=header.content.mapTo(header,QPoint(self.flow.save_status.geometry().right()+25,32))
+        point=header.content.mapTo(header,QPoint(self.flow.auto_save_switch.geometry().right()+25,20))
         self.assertTrue(header.canDrag(point))
         QTest.mouseDClick(header,Qt.LeftButton,pos=point)
         self.assertTrue(self.win.isMaximized())

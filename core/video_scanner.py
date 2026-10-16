@@ -62,7 +62,7 @@ def probe_video_file(file_path: str) -> VideoInfo:
         "-v", "error",
         "-show_entries",
         "stream=width,height,r_frame_rate,avg_frame_rate,codec_name,duration,codec_type,pix_fmt,color_transfer,sample_aspect_ratio,time_base"
-        ":format=duration",
+        ":stream_side_data=rotation:stream_tags=rotate:format=duration",
         "-of", "json",
         file_path
     ]
@@ -157,6 +157,22 @@ def probe_video_file(file_path: str) -> VideoInfo:
         # Audio presence derived from the combined probe result — no second call needed
         has_audio = len(audio_streams) > 0
 
+        rotation = 0
+        for sd in v_stream.get("side_data_list", []):
+            if "rotation" in sd:
+                try:
+                    rotation = int(float(sd["rotation"]))
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if not rotation:
+            rotate_tag = v_stream.get("tags", {}).get("rotate")
+            if rotate_tag:
+                try:
+                    rotation = int(float(rotate_tag))
+                except (ValueError, TypeError):
+                    pass
+
         return VideoInfo(
             path=file_path,
             filename=filename,
@@ -171,7 +187,8 @@ def probe_video_file(file_path: str) -> VideoInfo:
             pixel_format=v_stream.get("pix_fmt", ""),
             color_transfer=v_stream.get("color_transfer", ""),
             sample_aspect_ratio=v_stream.get("sample_aspect_ratio", "1:1"),
-            time_base=v_stream.get("time_base", "")
+            time_base=v_stream.get("time_base", ""),
+            rotation=rotation
         )
 
     except subprocess.TimeoutExpired:

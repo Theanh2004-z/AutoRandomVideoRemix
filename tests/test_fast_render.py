@@ -141,10 +141,16 @@ class FastRenderTests(unittest.TestCase):
         class Process:
             def __init__(self,command,*args,**kwargs):
                 self.returncode=0
-                directory=Path(command[-1]).parent
+                self.stdout=io.BytesIO()
+                self.stderr=io.BytesIO()
+                if '-i' in command:
+                    directory = Path(command[command.index('-i') + 1]).parent
+                else:
+                    directory = Path(command[-1]).parent
                 concat_contents.extend(p.read_bytes() for p in sorted(directory.glob('seg_*.mp4')))
                 Path(command[-1]).write_bytes(b'concat')
             def communicate(self): return b'',b''
+            def wait(self,timeout=None): return 0
         validation=SimpleNamespace(is_valid=True,actual_duration=2,actual_width=640,actual_height=360,actual_fps=30)
         def publish(**kwargs):
             os.replace(kwargs['staging_path'],kwargs['final_destination_path'])

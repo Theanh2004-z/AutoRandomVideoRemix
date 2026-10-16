@@ -56,13 +56,23 @@ def worker_count(config, encoder):
     return 1
 
 
+def frame_filter(w, h, aspect_ratio_mode, flags='bicubic'):
+    """Fit/crop using display aspect ratio, producing square pixels in one scale.
+
+    reset_sar makes proportional scaling account for input SAR before cropping;
+    merely appending setsar=1 afterwards would distort anamorphic sources.
+    Shared by the software render path and the thumbnail preview.
+    """
+    mode = 'increase' if aspect_ratio_mode=='crop' else 'decrease'
+    scale=f'scale={w}:{h}:force_original_aspect_ratio={mode}:force_divisible_by=2:flags={flags}:reset_sar=1'
+    finish=f'crop={w}:{h}' if mode=='increase' else f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black'
+    return scale+','+finish+',setsar=1'
+
+
 def cpu_filter(config):
     w,h = config.width_height
-    mode = 'increase' if config.aspect_ratio_mode=='crop' else 'decrease'
     flags = {'fast':'fast_bilinear','balanced':'bicubic','quality':'lanczos'}.get(getattr(config,'render_speed','balanced'),'bicubic')
-    scale=f'scale={w}:{h}:force_original_aspect_ratio={mode}:force_divisible_by=2:flags={flags}'
-    finish=f'crop={w}:{h}' if mode=='increase' else f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black'
-    return scale+','+finish+',setsar=1,format=yuv420p'
+    return frame_filter(w, h, config.aspect_ratio_mode, flags)+',format=yuv420p'
 
 
 @dataclass(frozen=True)
@@ -82,17 +92,21 @@ def choose_pipeline(config, encoder, info):
         return software
     if info.sample_aspect_ratio not in ('1:1','0:1','N/A','') or info.width<=0 or info.height<=0:
         return software
+    if getattr(info, 'rotation', 0) % 360 != 0:
+        return software
     w,h=config.width_height
     decoder=getattr(config,'decoder_mode','auto')
     if encoder=='h264_qsv' and decoder=='cpu':
         return software
-    exact_ratio=(info.width*h==info.height*w)
+    disp_w = getattr(info, 'display_width', info.width)
+    disp_h = getattr(info, 'display_height', info.height)
+    exact_ratio=(disp_w*h==disp_h*w)
     # CUDA handles high-resolution scaling; only padding/cropping, when needed,
     # returns to CPU at the reduced resolution. QSV uses the same safe finish.
-    scale=max(w/info.width,h/info.height) if config.aspect_ratio_mode=='crop' else min(w/info.width,h/info.height)
+    scale=max(w/disp_w,h/disp_h) if config.aspect_ratio_mode=='crop' else min(w/disp_w,h/disp_h)
     round_size=math.ceil if config.aspect_ratio_mode=='crop' else math.floor
-    sw=max(2,round_size(info.width*scale/2)*2)
-    sh=max(2,round_size(info.height*scale/2)*2)
+    sw=max(2,round_size(disp_w*scale/2)*2)
+    sh=max(2,round_size(disp_h*scale/2)*2)
     if exact_ratio: sw,sh=w,h
     if encoder=='h264_nvenc':
         algo={'fast':'bilinear','balanced':'bicubic','quality':'lanczos'}.get(getattr(config,'render_speed','balanced'),'bicubic')
@@ -147,6 +161,9 @@ class SegmentRenderer:
             percent=min(85,round(sum(self._progress_seconds.values())/self._total_seconds*85,1))
             self._last_percent=max(self._last_percent,percent)
             self.engine.on_progress(self._last_percent,message)
+            if hasattr(self.engine, 'on_video_progress') and callable(self.engine.on_video_progress):
+                v_pct = min(100.0, round(sum(self._progress_seconds.values())/self._total_seconds*100.0, 1))
+                self.engine.on_video_progress(v_pct)
 
     def stopped(self):
         return self.engine._is_cancelled or self._aborted.is_set()
@@ -244,7 +261,10 @@ class SegmentRenderer:
                     key=self._key(clip,pipeline)
                     cached=cache.get(key)
                     if cached and cache.verify_entry(cached):
-                        shutil.copy2(cached,path)
+                        try:
+                            os.link(cached,path)
+                        except OSError:
+                            shutil.copy2(cached,path)
                         with self._lock: self.stats['cache_hits']+=1
                         self.engine.on_log('INFO',f'Cache: {clip.source_video_name} · {clip.formatted_start}')
                         return True
@@ -428,6 +448,8 @@ class SegmentRenderer:
                             clip=plan[clip_index]; clip.status='Hoàn tất'
                             completed+=1
                             self.engine.on_segment_done(completed,len(plan),clip)
+                            if hasattr(self.engine, 'on_video_progress') and callable(self.engine.on_video_progress):
+                                self.engine.on_video_progress(round((completed / len(plan)) * 100.0, 1))
                         self.report_progress(groups[index][0],sum(plan[i].effective_duration for i in groups[index]),
                             f'Video #{video_index}/{total_videos}: Đã xử lý {completed}/{len(plan)} đoạn ({self.workers} tác vụ)')
             except BaseException as error:

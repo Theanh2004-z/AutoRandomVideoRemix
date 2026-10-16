@@ -206,7 +206,7 @@ class GuidedWorkflowTests(unittest.TestCase):
     def test_settings_keep_export_preferences_outside_session_page(self):
         dialog=self.flow.settings_dialog
         self.assertTrue(dialog.isAncestorOf(self.win.output_panel))
-        self.assertTrue(dialog.isAncestorOf(self.win.cut_panel.spin_seg_dur))
+        self.assertTrue(self.win.source_panel.isAncestorOf(self.win.cut_panel.spin_seg_dur))
         self.assertFalse(self.flow.pages[1].isAncestorOf(self.win.output_panel))
         self.assertTrue(self.flow.pages[1].isAncestorOf(self.win.cut_panel.spin_secs))
 

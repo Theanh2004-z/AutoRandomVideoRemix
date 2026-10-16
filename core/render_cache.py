@@ -13,9 +13,15 @@ import hashlib
 import time
 import threading
 import uuid
+import re
 from typing import Optional, Dict, Any, List
 
 from core.app_paths import get_cache_dir
+from core.storage_cleanup import is_link, process_alive
+
+
+def _link_count(path):
+    return os.stat(path).st_nlink
 
 
 class RenderCache:
@@ -25,15 +31,24 @@ class RenderCache:
         self,
         cache_dir: Optional[str] = None,
         max_size_bytes: int = 5 * 1024 * 1024 * 1024,  # 5 GB default
-        enabled: bool = True
+        enabled: bool = True,
+        min_free_bytes: int = 2 * 1024**3
     ):
-        self.cache_dir = cache_dir or get_cache_dir()
+        self.cache_dir = os.path.realpath(os.path.abspath(cache_dir or get_cache_dir()))
         self.max_size_bytes = max_size_bytes
         self.enabled = enabled
+        self.min_free_bytes = max(0, int(min_free_bytes))
+        self._owned_keys = set()
         self._lock = threading.RLock()
         self._access_order: Dict[str, float] = {}
+        self._approx_size_bytes: Optional[int] = None
         if self.enabled:
             os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _init_approx_size(self):
+        if self._approx_size_bytes is None:
+            entries = self._get_cache_entries()
+            self._approx_size_bytes = sum(e["size"] for e in entries)
 
     @staticmethod
     def compute_key(
@@ -87,6 +102,8 @@ class RenderCache:
 
     def get_cache_path(self, cache_key: str) -> str:
         """Returns the file path for a cache key."""
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', cache_key):
+            raise ValueError('Invalid cache key')
         return os.path.join(self.cache_dir, f"{cache_key}.mp4")
 
     @staticmethod
@@ -124,7 +141,7 @@ class RenderCache:
             return None
 
         path = self.get_cache_path(cache_key)
-        if os.path.isfile(path):
+        if not is_link(path) and os.path.isfile(path):
             if not self.verify_entry(path):
                 try:
                     os.remove(path)
@@ -152,24 +169,63 @@ class RenderCache:
         if not os.path.isfile(rendered_file_path) or os.path.getsize(rendered_file_path) == 0:
             return None
 
-        target_path = self.get_cache_path(cache_key)
-        staging_path = target_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}"
+        with self._lock:
+            target_path = self.get_cache_path(cache_key)
+            staging_path = target_path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}"
+            if os.path.lexists(target_path) and is_link(target_path):
+                return None
+            self._owned_keys.add(cache_key)
+            try:
+                file_size = os.path.getsize(rendered_file_path)
+                if file_size > self.max_size_bytes:
+                    return None
+                self._init_approx_size()
+                # Existing immutable entries are reused rather than replaced;
+                # readers may hold hard links to them in an active workspace.
+                if os.path.isfile(target_path) and self.verify_entry(target_path):
+                    return target_path
+                if (self._approx_size_bytes + file_size > self.max_size_bytes
+                        or shutil.disk_usage(self.cache_dir).free < self.min_free_bytes + file_size):
+                    self._ensure_size_limit(incoming_bytes=file_size)
+                if (self._approx_size_bytes + file_size > self.max_size_bytes
+                        or shutil.disk_usage(self.cache_dir).free < self.min_free_bytes + file_size):
+                    return None  # Rendering continues without caching this clip.
+                old_size = os.path.getsize(target_path) if os.path.isfile(target_path) else 0
+                shutil.copy2(rendered_file_path, staging_path)
+                os.replace(staging_path, target_path)
+                self._access_order[cache_key] = time.time()
+                self._approx_size_bytes += file_size - old_size
+                return target_path
+            except OSError:
+                return None
+            finally:
+                if os.path.exists(staging_path):
+                    try:
+                        os.remove(staging_path)
+                    except OSError:
+                        pass
 
-        try:
-            shutil.copy2(rendered_file_path, staging_path)
-            os.replace(staging_path, target_path)
-            self._access_order[cache_key] = time.time()
+    def flush(self):
+        """Forces size limit check immediately."""
+        with self._lock:
+            self._clean_staging()
             self._ensure_size_limit()
-            return target_path
-        except Exception:
-            if os.path.exists(staging_path):
-                try:
-                    os.remove(staging_path)
-                except Exception:
-                    pass
-            return None
 
-    def _ensure_size_limit(self):
+    def _clean_staging(self):
+        if not os.path.isdir(self.cache_dir):
+            return
+        for name in os.listdir(self.cache_dir):
+            match = re.fullmatch(r'[0-9a-f]{24}\.mp4\.tmp_(\d+)_[0-9a-f]+', name)
+            path = os.path.join(self.cache_dir, name)
+            if not match or is_link(path) or not os.path.isfile(path):
+                continue
+            try:
+                if time.time() - os.stat(path).st_mtime > 86400 and not process_alive(int(match[1])):
+                    os.remove(path)
+            except OSError:
+                continue
+
+    def _ensure_size_limit(self, incoming_bytes=0):
         """Evicts oldest accessed files until total size is within max_size_bytes."""
         if not self.enabled or self.max_size_bytes <= 0:
             return
@@ -177,7 +233,9 @@ class RenderCache:
         entries = self._get_cache_entries()
         total_size = sum(e["size"] for e in entries)
 
-        if total_size <= self.max_size_bytes:
+        free_bytes = shutil.disk_usage(self.cache_dir).free
+        if total_size + incoming_bytes <= self.max_size_bytes and free_bytes >= self.min_free_bytes + incoming_bytes:
+            self._approx_size_bytes = total_size
             return
 
         # Sort by access_time ascending (oldest first)
@@ -185,13 +243,19 @@ class RenderCache:
 
         for entry in entries:
             try:
+                # Removing this name would not reclaim space while a live
+                # workspace holds a hard link. Leave active cache clips alone.
+                if _link_count(entry['path']) > 1:
+                    continue
                 os.remove(entry["path"])
                 self._access_order.pop(entry["key"], None)
                 total_size -= entry["size"]
+                free_bytes = shutil.disk_usage(self.cache_dir).free
             except Exception:
                 pass
-            if total_size <= self.max_size_bytes:
+            if total_size + incoming_bytes <= self.max_size_bytes and free_bytes >= self.min_free_bytes + incoming_bytes:
                 break
+        self._approx_size_bytes = total_size
 
     def _get_cache_entries(self) -> List[Dict[str, Any]]:
         """Scans cache directory and returns file stats."""
@@ -200,8 +264,10 @@ class RenderCache:
             return entries
 
         for name in os.listdir(self.cache_dir):
-            if name.endswith(".mp4") and not name.startswith(".tmp_"):
+            if name.endswith(".mp4") and (re.fullmatch(r'[0-9a-f]{24}\.mp4', name) or name[:-4] in self._owned_keys):
                 path = os.path.join(self.cache_dir, name)
+                if is_link(path) or not os.path.isfile(path):
+                    continue
                 try:
                     st = os.stat(path)
                     key = os.path.splitext(name)[0]
@@ -221,18 +287,17 @@ class RenderCache:
     def clear(self) -> int:
         """Removes all cached files and returns number of files deleted."""
         deleted = 0
-        self._access_order.clear()
-        if not os.path.isdir(self.cache_dir):
-            return 0
-
-        for name in os.listdir(self.cache_dir):
-            path = os.path.join(self.cache_dir, name)
-            try:
-                if os.path.isfile(path) or os.path.islink(path):
-                    os.remove(path)
+        with self._lock:
+            for entry in self._get_cache_entries():
+                try:
+                    if _link_count(entry['path']) > 1:
+                        continue
+                    os.remove(entry['path'])
+                    self._access_order.pop(entry['key'], None)
                     deleted += 1
-            except Exception:
-                pass
+                except OSError:
+                    pass
+            self._approx_size_bytes = sum(e['size'] for e in self._get_cache_entries())
         return deleted
 
     def get_stats(self) -> Dict[str, Any]:
