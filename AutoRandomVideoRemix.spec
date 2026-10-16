@@ -35,6 +35,11 @@ hiddenimports = [
     'core.filename_generator',
     'core.pool_manager',
     'core.audio_pool_manager',
+    'core.version',
+    'core.update_manager',
+    'core.update_service',
+    'core.storage_cleanup',
+    'ui.update_dialog',
     'sqlite3',
 ]
 
