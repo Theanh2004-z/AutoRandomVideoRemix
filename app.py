@@ -30,6 +30,8 @@ from ui.main_window import MainWindow
 
 
 def main():
+    from core.app_identity import configure_windows_identity, icon_path
+    configure_windows_identity()
     # Enable High DPI scaling
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -41,6 +43,8 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("Antigravity")
+    from PySide6.QtGui import QIcon
+    app.setWindowIcon(QIcon(str(icon_path())))
 
     # An independent helper can recover even if the previous directory swap
     # was interrupted. Never construct windows against an unfinished install.

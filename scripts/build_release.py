@@ -121,10 +121,21 @@ def main():
         default="",
         help="Changelog or release notes description"
     )
+    parser.add_argument('--installer', action='store_true', help='Also build the recommended Windows Setup.exe')
+    parser.add_argument('--iscc', help='Path to the Inno Setup compiler (ISCC.exe)')
     args = parser.parse_args()
 
     try:
+        from scripts.verify_distribution import verify_distribution
+        verify_distribution(args.dist_dir)
+        print('Packaged application startup verified.')
+        if args.installer:
+            from scripts.build_installer import build_installer
+            setup_path = build_installer(args.dist_dir, args.output_dir, args.version, args.iscc)
+            print(f'Installer for new users: {setup_path}')
         package_release(args.dist_dir, args.output_dir, version=args.version, notes=args.notes)
+        if args.installer:
+            print('Upload Setup.exe for new users; keep the ZIP and update_manifest.json for automatic updates.')
     except Exception as e:
         print(f"Error packaging release: {e}", file=sys.stderr)
         sys.exit(1)

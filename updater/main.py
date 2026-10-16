@@ -1,5 +1,6 @@
 """Independent updater with directory swaps and recoverable transactions."""
 import argparse
+import atexit
 from contextlib import contextmanager
 import hashlib
 import json
@@ -17,6 +18,20 @@ import uuid
 logger = logging.getLogger(__name__)
 TERMINAL_STATES = {"committed", "rolled_back", "aborted", "failed"}
 BACKUP_MARKER = ".remix-update-backup.json"
+APP_MUTEX_NAME = 'Theanh2004z.AutoRandomVideoRemix'
+
+
+def hold_install_mutex():
+    # Install/uninstall must also wait while the standalone updater is running.
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        kernel = _kernel()
+        kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel.CreateMutexW(None, False, APP_MUTEX_NAME)
+        if handle:
+            atexit.register(kernel.CloseHandle, handle)
 
 
 def atomic_write_json(path, data):
@@ -412,6 +427,7 @@ def execute_update_transaction(plan):
 
 
 def main():
+    hold_install_mutex()
     log_dir = os.environ.get("LOCALAPPDATA", tempfile.gettempdir())
     logging.basicConfig(filename=os.path.join(log_dir, "AutoRandomVideoRemix_updater.log"),
                         format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)

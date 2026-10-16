@@ -33,10 +33,16 @@ echo.
 "%PY_BIN%" -m PyInstaller --noconfirm --clean AutoRandomVideoRemix.spec
 
 if %errorlevel% equ 0 (
+    "%PY_BIN%" scripts\verify_distribution.py "%~dp0dist\AutoRandomVideoRemix"
+    if errorlevel 1 (
+        echo [LOI] EXE khong khoi dong duoc. Khong tao ban phat hanh.
+        if not defined REMIX_NO_PAUSE pause
+        exit /b 1
+    )
     "%PY_BIN%" scripts\build_updater.py "%~dp0dist\AutoRandomVideoRemix"
     if errorlevel 1 (
         echo [LOI] Khong tao duoc updater.exe. Ban dong goi chua hoan chinh.
-        pause
+        if not defined REMIX_NO_PAUSE pause
         exit /b 1
     )
     echo.
@@ -48,6 +54,9 @@ if %errorlevel% equ 0 (
 ) else (
     echo.
     echo [LOI] Dong goi that bai. Ma loi: %errorlevel%
+    if not defined REMIX_NO_PAUSE pause
+    exit /b 1
 )
 
-pause
+if not defined REMIX_NO_PAUSE pause
+exit /b 0

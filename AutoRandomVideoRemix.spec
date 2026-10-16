@@ -1,7 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
+from scripts.build_icon import build_icon
+from scripts.verify_distribution import filter_system_icu
 
-datas = [('bin', 'bin')]
+app_icon = str(build_icon(SPECPATH))
+
+datas = [('bin', 'bin'), ('assets', 'assets')]
 binaries = []
 hiddenimports = [
     'core',
@@ -61,6 +65,9 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# The build machine may have Poppler/Conda ICU on PATH. Qt expects the
+# Windows ICU API instead; a foreign icuuc.dll makes QtCore fail at startup.
+a.binaries = filter_system_icu(a.binaries)
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -69,6 +76,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='AutoRandomVideoRemix',
+    icon=app_icon,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

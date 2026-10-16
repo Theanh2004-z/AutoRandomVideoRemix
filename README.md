@@ -136,7 +136,7 @@ e:\TOOL\AutoRandomVideoRemix/
 ## 🛠️ HƯỚNG DẪN CÀI ĐẶT & CHẠY
 
 ### 1. Yêu cầu môi trường
-* Windows 10 hoặc Windows 11 (64-bit).
+* Windows 10 1809 trở lên hoặc Windows 11 (64-bit).
 * Python 3.10+ (Đã tích hợp sẵn tại `e:\TOOL\python\python.exe`).
 * Thư viện: `PySide6`, `QFluentWidgets` (cài qua `requirements.txt`).
 * FFmpeg và ffprobe đã được tích hợp sẵn trong thư mục `bin/` của dự án.
@@ -164,3 +164,30 @@ e:\TOOL\AutoRandomVideoRemix\build_exe.bat
 ```
 File thực thi `.exe` độc lập hoàn chỉnh sẽ được tạo tại:
 `dist\AutoRandomVideoRemix\AutoRandomVideoRemix.exe` (đã đóng gói sẵn FFmpeg, ffprobe, DLL và giao diện Fluent UI, không mang theo dữ liệu cá nhân).
+
+### 5. Bản cài đặt có icon và tìm kiếm trong Windows
+
+Người dùng mới nên tải `AutoRandomVideoRemix-<phiên bản>-windows-x64-Setup.exe` trong GitHub Releases.
+Bộ cài tạo mục **REMIX (AutoRandomVideoRemix)** trong Start Menu, có tùy chọn tạo biểu tượng Desktop
+và đăng ký mục gỡ cài đặt trong Windows Settings. Sau khi cài, nhấn phím Windows và tìm **REMIX**.
+Windows có thể cần một khoảng thời gian để cập nhật kết quả tìm kiếm.
+
+Bản ZIP là bản portable: giải nén toàn bộ thư mục rồi mở EXE; bản này không tự đăng ký Start Menu.
+Không tách EXE khỏi thư mục `_internal`.
+
+Để tạo bản phát hành đầy đủ, cài [Inno Setup 6.3+ hoặc 7](https://jrsoftware.org/isdl.php),
+rồi chạy `build_release.bat`. Có thể dùng compiler portable tại `tools/inno/ISCC.exe`
+hoặc đặt biến `INNO_SETUP_COMPILER` tới `ISCC.exe`.
+
+Kết quả nằm trong `releases/`: tải **Setup.exe** lên cho người dùng mới, đồng thời tải
+**ZIP** và **update_manifest.json** lên cùng Release cho cơ chế tự động cập nhật.
+Không đưa riêng Setup.exe vào manifest tải ZIP. Chỉ đổi phiên bản sau khi kiểm thử và tạo Release mới.
+
+Bộ cài lưu chương trình tại `%LOCALAPPDATA%\Programs\AutoRandomVideoRemix\App`, còn bộ gỡ
+cài đặt ở thư mục `Uninstall` bên cạnh, nên vẫn hoạt động sau khi cập nhật thay thư mục `App`.
+Thiết lập và lịch sử vẫn lưu trong AppData; gỡ cài đặt không xóa những dữ liệu đó hoặc video đã xuất.
+
+Quy trình build tự thử khởi động EXE bằng thiết lập tạm, tắt kiểm tra cập nhật và không dùng
+DLL từ các công cụ trong PATH của máy build. Nếu EXE không khởi động được thì dừng phát hành.
+Không chép `icuuc.dll`, `icuin.dll`, `icu.dll` từ Poppler/Conda vào bản đóng gói: Qt dùng
+các API ICU có sẵn trong Windows. Spec đã loại những tên DLL này để tránh lỗi nạp QtCore.

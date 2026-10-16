@@ -6,6 +6,8 @@ __pycache__/
 # PyInstaller / Distribution artifacts
 build/
 dist/
+releases/
+tools/inno/
 *.manifest
 *.spec.bak
 
